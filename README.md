@@ -4,7 +4,7 @@ An autonomous coding agent that plans, writes, tests, and fixes code on its own 
 and (coming soon) forks its execution environment to try several implementation
 strategies in parallel, keeping whichever passes the tests.
 
-Built for the **Nebius x NVIDIA Global AI Hackathon 2026** (Coding and Agentic Engineering track).
+Coding and Agentic Engineering track
 
 ## Status: Day 1
 
@@ -12,16 +12,16 @@ Built for the **Nebius x NVIDIA Global AI Hackathon 2026** (Coding and Agentic E
 - [x] Tool-using agent loop: write file, read file, run command
 - [x] Self-correction: runs its own code and fixes errors
 - [x] Step limit and JSONL logging of every action
-- [ ] Docker sandbox
+- [x] Docker sandbox
 - [ ] Planner and Reflector
 - [ ] Parallel branching on Nebius Sandboxes
 - [ ] Fine-tuned Nemotron executor
 - [ ] Web interface
 - [ ] Benchmark
 
-## How it uses Nebius and NVIDIA
+## How it uses Nebius and AI Models
 
-All model calls go to an NVIDIA Nemotron model served on Nebius Token Factory
+All model calls go to a Deepseek-v4 model served on Nebius Token Factory
 through its OpenAI-compatible API.
 
 ## Quickstart
