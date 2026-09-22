@@ -8,7 +8,7 @@ Coding and Agentic Engineering track
 
 ## Status: Day 1
 
-- [x] Connected to NVIDIA Nemotron via Nebius Token Factory
+- [x] Connected to Deepseek via Nebius Token Factory
 - [x] Tool-using agent loop: write file, read file, run command
 - [x] Self-correction: runs its own code and fixes errors
 - [x] Step limit and JSONL logging of every action
