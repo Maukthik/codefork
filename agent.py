@@ -1,37 +1,40 @@
-"""Project Fork - Autonomous Coding Agent.
+"""Project Fork - Autonomous Coding Agent (with Planner + Reflector).
 
-A minimal coding agent: it receives a task, writes code into the
-'workspace' folder, runs it, reads the result, and fixes errors,
-until the task is done or MAX_STEPS is reached.
+Flow:  task -> PLANNER makes steps -> agent loop works step by step
+       -> if a command fails, REFLECTOR diagnoses it -> agent retries
+       smarter, never repeating an approach that already failed.
 
 Run:  python agent.py
 """
 import datetime
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from pydantic import BaseModel, ValidationError
 
 load_dotenv()
 
 # ===============================================================
-# Dynamic Switch: Ollama, OpenRouter, or Nebius
+# Dynamic Switch: Ollama, OpenRouter, or Nebius   (unchanged)
 # ===============================================================
 PROVIDER = os.environ.get("PROVIDER", "ollama").lower()
 
 if PROVIDER == "ollama":
-    print("🏠 Running in COLLEGE MODE (Local Ollama Engine)")
+    print("Running in COLLEGE MODE (Local Ollama Engine)")
     client = OpenAI(
         base_url=os.environ.get("OLLAMA_URL", "http://localhost:11434/v1"),
-        api_key="ollama",  
+        api_key="ollama",
     )
     MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b-instruct-q4_K_M")
 
 elif PROVIDER == "openrouter":
-    print("🔀 Running in CLOUD MODE (OpenRouter Engine)")
+    print("Running in CLOUD MODE (OpenRouter Engine)")
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=os.environ["OPENROUTER_API_KEY"],
@@ -39,16 +42,17 @@ elif PROVIDER == "openrouter":
     MODEL = os.environ["OPENROUTER_MODEL"]
 
 else:
-    print("🚀 Running in HACKATHON MODE (Cloud Nebius Engine)")
+    print("Running in HACKATHON MODE (Cloud Nebius Engine)")
     client = OpenAI(
         base_url="https://api.tokenfactory.uk-south1.nebius.com/v1",
         api_key=os.environ["NEBIUS_API_KEY"],
     )
-    MODEL = os.environ.get("NEBIUS_MODEL", "deepseek-ai/DeepSeek-V4-Pro")
+    MODEL = os.environ["NEBIUS_MODEL"]   # must be an NVIDIA (Nemotron) model for the hackathon
 
 # ===============================================================
 
-MAX_STEPS = 15                       
+MAX_STEPS = 25            # total model turns across ALL plan steps (planning adds turns)
+MAX_PLAN_STEPS = 6        # planner may not create more than this
 WORKSPACE = Path("workspace").resolve()
 WORKSPACE.mkdir(exist_ok=True)
 LOG_DIR = Path("logs")
@@ -57,8 +61,7 @@ LOG_FILE = LOG_DIR / f"run_{datetime.datetime.now():%Y%m%d_%H%M%S}.jsonl"
 
 
 # ---------------------------------------------------------------
-# File system safety helpers 
-# (Execution is now sandboxed via Docker)
+# File system safety helpers   (unchanged)
 # ---------------------------------------------------------------
 def safe_path(relative_path: str) -> Path:
     """Only allow files inside the workspace folder."""
@@ -69,7 +72,7 @@ def safe_path(relative_path: str) -> Path:
 
 
 # ---------------------------------------------------------------
-# The three tools
+# The three tools   (unchanged)
 # ---------------------------------------------------------------
 def read_file(path: str) -> str:
     p = safe_path(path)
@@ -89,26 +92,21 @@ def write_file(path: str, content: str) -> str:
 
 
 def run_command(command: str = "", cmd: str = "") -> str:
-    # Accepts both 'command' and 'cmd' to prevent model hallucinations
-    actual_command = command or cmd 
+    actual_command = command or cmd
     cmd_str = actual_command.strip()
-    
-    # We mount the local workspace folder to /workspace in the container
     docker_cmd = [
-        "docker", "run", "--rm", 
-        "-v", f"{WORKSPACE.absolute()}:/workspace", 
-        "-w", "/workspace", 
+        "docker", "run", "--rm",
+        "-v", f"{WORKSPACE.absolute()}:/workspace",
+        "-w", "/workspace",
         "python:3.14-rc-slim",
-        "sh", "-c", cmd_str
+        "sh", "-c", cmd_str,
     ]
-    
     try:
         result = subprocess.run(
             docker_cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL
         )
     except subprocess.TimeoutExpired:
         return "ERROR: command timed out after 30 seconds"
-    
     return (
         f"exit_code: {result.returncode}\n"
         f"stdout:\n{result.stdout[-2000:]}\n"
@@ -162,16 +160,18 @@ TOOLS = [
 ]
 
 SYSTEM_PROMPT = """You are a coding agent. You complete programming tasks by calling tools.
+You will be given a PLAN and told which step to work on. Work only on the current step.
 Work in small steps: write the code, run it, read the output, and fix any problems.
-Always run your code to verify it works before finishing.
+Always run your code to verify the step's success check before finishing the step.
 Use only relative file paths.
 CRITICAL: You ONLY have access to the following tools: `read_file`, `write_file`, and `run_command`. Do not attempt to use or invent any other tools.
 When using `run_command`, ensure the parameter name is 'command'.
-When the task is fully done and verified, reply with a short summary and do not call any tools."""
+If you receive a REFLECTION message, follow its guidance and never repeat a listed failed approach.
+When the CURRENT STEP is done and verified, reply with a one-line summary and do not call any tools."""
 
 
 # ---------------------------------------------------------------
-# Logging
+# Logging   (unchanged)
 # ---------------------------------------------------------------
 def log(event: dict) -> None:
     event["time"] = datetime.datetime.now().isoformat()
@@ -184,19 +184,143 @@ def short(text: str, n: int = 300) -> str:
     return text if len(text) <= n else text[:n] + "..."
 
 
-# ---------------------------------------------------------------
-# The agent loop
-# ---------------------------------------------------------------
-def run_agent(task: str) -> None:
+# ===============================================================
+# NEW: shared helper - ask the model for JSON and parse it safely
+# ===============================================================
+def extract_json(text: str) -> dict:
+    """Pull a JSON object out of a model reply.
+    Handles <think>...</think> blocks and ```json fences that models often add."""
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
+    text = text.replace("```json", "").replace("```", "")
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError("no JSON object found")
+    return json.loads(text[start:end + 1])
+
+
+def ask_json(system: str, user: str, schema: type[BaseModel]):
+    """Call the model WITHOUT tools, expect JSON matching `schema`.
+    Retries once. Returns a validated object, or None if it keeps failing."""
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    for attempt in range(2):
+        reply = client.chat.completions.create(
+            model=MODEL, messages=messages, temperature=0, max_tokens=2000,
+        )
+        text = reply.choices[0].message.content or ""
+        try:
+            return schema(**extract_json(text))
+        except (ValueError, ValidationError, TypeError) as e:
+            log({"event": "json_parse_failed", "schema": schema.__name__,
+                 "attempt": attempt + 1, "error": str(e), "reply": text[:500]})
+            messages += [{"role": "assistant", "content": text},
+                         {"role": "user", "content": "That was not valid JSON in the required shape. "
+                                                     "Reply with ONLY the JSON object, nothing else."}]
+    return None
+
+
+# ===============================================================
+# NEW: PLANNER
+# ===============================================================
+class Step(BaseModel):
+    id: int
+    description: str
+    success_check: str
+
+
+class Plan(BaseModel):
+    steps: list[Step]
+
+
+PLANNER_PROMPT = f"""You are the planning module of a coding agent.
+Break the user's programming task into 2 to {MAX_PLAN_STEPS} ordered, concrete steps.
+Each step must be small enough to finish with a few file writes and one test run,
+and must have a success_check that can be verified by running a command.
+Reply with ONLY this JSON, no other text:
+{{"steps": [{{"id": 1, "description": "...", "success_check": "..."}}]}}"""
+
+
+def make_plan(task: str) -> list[Step]:
+    plan = ask_json(PLANNER_PROMPT, f"Task: {task}", Plan)
+    if plan is None or not plan.steps:
+        # Fallback: never block the agent just because planning failed
+        steps = [Step(id=1, description=task, success_check="The code runs and the task is satisfied")]
+    else:
+        steps = plan.steps[:MAX_PLAN_STEPS]
+    log({"event": "plan", "steps": [s.model_dump() for s in steps], "fallback": plan is None})
+    return steps
+
+
+def step_message(steps: list[Step], idx: int) -> str:
+    s = steps[idx]
+    return f"CURRENT STEP {s.id} of {len(steps)}: {s.description}\nSuccess check: {s.success_check}"
+
+
+# ===============================================================
+# NEW: REFLECTOR
+# ===============================================================
+class Reflection(BaseModel):
+    diagnosis: str
+    category: Literal["syntax", "logic", "missing_dependency", "wrong_approach",
+                      "environment", "bad_test", "other"]
+    next_action: Literal["fix_code", "change_approach", "fix_test", "fix_environment"]
+
+
+REFLECTOR_PROMPT = """You are the reflection module of a coding agent.
+A command failed. Diagnose WHY in one or two sentences, classify it, and choose the next action.
+Do not suggest any approach listed under "Already failed".
+Reply with ONLY this JSON, no other text:
+{"diagnosis": "...",
+ "category": "syntax|logic|missing_dependency|wrong_approach|environment|bad_test|other",
+ "next_action": "fix_code|change_approach|fix_test|fix_environment"}"""
+
+
+def command_failed(tool_name: str, result: str) -> bool:
+    if tool_name != "run_command":
+        return False
+    if result.startswith("ERROR"):
+        return True
+    m = re.search(r"exit_code: (-?\d+)", result)
+    return bool(m) and int(m.group(1)) != 0
+
+
+def reflect(step: Step, command: str, output: str, failed: list[str]) -> Reflection:
+    user = (f"Current step: {step.description}\n"
+            f"Command: {command}\n"
+            f"Output (end):\n{output[-1500:]}\n"
+            f"Already failed:\n" + ("\n".join(f"- {f}" for f in failed) or "- none"))
+    r = ask_json(REFLECTOR_PROMPT, user, Reflection)
+    if r is None:
+        r = Reflection(diagnosis="Command failed; see the error output.",
+                       category="other", next_action="fix_code")
+    return r
+
+
+# ===============================================================
+# The agent loop (now plan-driven, with reflection)
+# ===============================================================
+def run_agent(task: str) -> dict:
+    total_in = total_out = 0
+    log({"event": "task", "task": task, "provider": PROVIDER, "model": MODEL})
+
+    # ---- 1. PLAN ----
+    steps = make_plan(task)
+    print("\nPLAN:")
+    for s in steps:
+        print(f"  {s.id}. {s.description}   [check: {s.success_check}]")
+
+    plan_text = "\n".join(f"{s.id}. {s.description}" for s in steps)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": task},
+        {"role": "user", "content": f"TASK: {task}\n\nPLAN:\n{plan_text}\n\n{step_message(steps, 0)}"},
     ]
-    log({"event": "task", "task": task, "model": MODEL})
-    total_in = total_out = 0
 
-    for step in range(1, MAX_STEPS + 1):
-        print(f"\n===== Step {step} =========")
+    idx = 0                     # which plan step we are on
+    failed_approaches = []      # reflector memory - never repeat these
+    seen_errors = set()         # detects the exact same error happening twice
+
+    # ---- 2. EXECUTE step by step ----
+    for turn in range(1, MAX_STEPS + 1):
+        print(f"\n===== Turn {turn} | Step {steps[idx].id}/{len(steps)} =====")
         response = client.chat.completions.create(
             model=MODEL, messages=messages, tools=TOOLS,
             temperature=0, max_tokens=4000,
@@ -206,7 +330,6 @@ def run_agent(task: str) -> None:
             total_in += response.usage.prompt_tokens
             total_out += response.usage.completion_tokens
 
-        # Save the model's reply into the conversation
         assistant_msg = {"role": "assistant", "content": msg.content or ""}
         if msg.tool_calls:
             assistant_msg["tool_calls"] = [
@@ -216,39 +339,71 @@ def run_agent(task: str) -> None:
             ]
         messages.append(assistant_msg)
 
-        # No tool calls = the model says it is finished
+        # No tool calls = the current STEP is finished
         if not msg.tool_calls:
-            print("AGENT FINISHED:")
-            print(msg.content)
-            log({"event": "finish", "summary": msg.content, "steps": step,
-                 "tokens_in": total_in, "tokens_out": total_out})
-            print(f"\nSteps: {step} | tokens in: {total_in} | tokens out: {total_out}")
-            print(f"Log saved to: {LOG_FILE}")
-            return
+            print(f"STEP {steps[idx].id} DONE: {short(msg.content, 200)}")
+            log({"event": "step_done", "step": steps[idx].id, "summary": msg.content})
+            idx += 1
+            if idx >= len(steps):
+                print("\nALL STEPS COMPLETE")
+                log({"event": "finish", "turns": turn, "tokens_in": total_in, "tokens_out": total_out,
+                     "failed_approaches": failed_approaches})
+                print(f"Turns: {turn} | tokens in: {total_in} | tokens out: {total_out}")
+                print(f"Log saved to: {LOG_FILE}")
+                return {"status": "done", "turns": turn, "steps": len(steps),
+                        "reflections": len(failed_approaches), "log": str(LOG_FILE)}
+            messages.append({"role": "user", "content": step_message(steps, idx)})
+            continue
 
-        # Run every tool the model asked for
+        # Run every tool the model asked for; remember failures
+        failures = []
         for tc in msg.tool_calls:
             name = tc.function.name
             try:
                 args = json.loads(tc.function.arguments or "{}")
                 result = FUNCTIONS[name](**args)
             except KeyError:
-                result = f"ERROR: unknown tool '{name}'"
+                args, result = {}, f"ERROR: unknown tool '{name}'"
             except Exception as e:
-                result = f"ERROR: {type(e).__name__}: {e}"
+                args, result = {}, f"ERROR: {type(e).__name__}: {e}"
 
             print(f"TOOL  {name}({short(tc.function.arguments, 120)})")
             print(f"RESULT {short(result)}")
-            log({"event": "tool", "step": step, "tool": name,
+            log({"event": "tool", "turn": turn, "step": steps[idx].id, "tool": name,
                  "arguments": tc.function.arguments, "result": result})
-
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
 
-    print(f"\nStopped: reached the limit of {MAX_STEPS} steps.")
+            if command_failed(name, result):
+                failures.append((args.get("command") or args.get("cmd") or "", result))
+
+        # ---- 3. REFLECT on the last failure this turn ----
+        # (Must come AFTER all tool results - the API requires tool results
+        #  to directly follow the assistant message that requested them.)
+        if failures:
+            command, output = failures[-1]
+            r = reflect(steps[idx], command, output, failed_approaches)
+            failed_approaches.append(f"Step {steps[idx].id}: {r.diagnosis}")
+
+            signature = output[-200:]
+            repeated = signature in seen_errors
+            seen_errors.add(signature)
+
+            note = (f"REFLECTION ({r.category} -> {r.next_action}): {r.diagnosis}\n"
+                    f"Already failed, do NOT repeat:\n" + "\n".join(f"- {f}" for f in failed_approaches))
+            if repeated:
+                note += "\nThis EXACT error happened before - your last fix did not work. Try a different approach."
+            print(f"REFLECT [{r.category} -> {r.next_action}] {short(r.diagnosis, 200)}")
+            log({"event": "reflection", "turn": turn, "step": steps[idx].id,
+                 **r.model_dump(), "repeated_error": repeated})
+            messages.append({"role": "user", "content": note})
+
+    print(f"\nStopped: reached the limit of {MAX_STEPS} turns.")
     log({"event": "max_steps", "tokens_in": total_in, "tokens_out": total_out})
+    return {"status": "max_steps", "turns": MAX_STEPS, "steps": len(steps),
+            "completed_steps": idx, "reflections": len(failed_approaches), "log": str(LOG_FILE)}
 
 
 if __name__ == "__main__":
     task = input("Enter a task for the agent: ").strip()
     if task:
-        run_agent(task)
+        print(run_agent(task))
