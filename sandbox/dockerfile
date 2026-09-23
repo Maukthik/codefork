@@ -1,0 +1,10 @@
+# Sandbox image for the agent: Python + pytest, nothing else.
+# Build once (from the fork folder):   docker build -t fork-sandbox sandbox
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir pytest
+
+# Don't litter the workspace with __pycache__ folders
+ENV PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /workspace

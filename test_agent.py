@@ -119,26 +119,53 @@ def read_log(path):
     return [json.loads(line) for line in open(path, encoding="utf-8")]
 
 
+FAIL = "exit_code: 1\nstdout:\n\nstderr:\nAssertionError\n"
+PASS = "exit_code: 0\nstdout:\nok\nstderr:\n"
+
+
 def test_loop_reflects_and_recovers(monkeypatch):
-    fail = "exit_code: 1\nstdout:\n\nstderr:\nAssertionError\n"
+    """Fail -> reflect -> edit file -> fail again -> reflect again -> fix -> pass."""
     result = run_scripted(monkeypatch,
         agent_replies=[
             reply(calls=[tool_call(1, "write_file", {"path": "primes.py", "content": "x"})]),
             reply(content="step 1 done"),
             reply(calls=[tool_call(2, "run_command", {"command": "python test_primes.py"})]),
-            reply(calls=[tool_call(3, "run_command", {"command": "python test_primes.py"})]),
-            reply(calls=[tool_call(4, "run_command", {"command": "python test_primes.py"})]),
+            reply(calls=[tool_call(3, "write_file", {"path": "primes.py", "content": "y"}),
+                         tool_call(4, "run_command", {"command": "python test_primes.py"})]),
+            reply(calls=[tool_call(5, "write_file", {"path": "primes.py", "content": "z"}),
+                         tool_call(6, "run_command", {"command": "python test_primes.py"})]),
             reply(content="step 2 done"),
         ],
-        command_outputs=[fail, fail, "exit_code: 0\nstdout:\nok\nstderr:\n"],
+        command_outputs=[FAIL, FAIL, PASS],
     )
     assert result["status"] == "done"
-    assert result["reflections"] == 2
+    assert result["reflections"] == 2 and result["skipped_reflections"] == 0
     events = read_log(result["log"])
     kinds = [e["event"] for e in events]
     assert kinds[:2] == ["task", "plan"] and kinds[-1] == "finish"
     reflections = [e for e in events if e["event"] == "reflection"]
     assert [e["repeated_error"] for e in reflections] == [False, True]
+
+
+def test_rerun_without_change_skips_reflection(monkeypatch):
+    """Re-running a failed command with no file change must NOT call the reflector."""
+    result = run_scripted(monkeypatch,
+        agent_replies=[
+            reply(content="step 1 done"),
+            reply(calls=[tool_call(1, "run_command", {"command": "pytest"})]),
+            reply(calls=[tool_call(2, "run_command", {"command": "pytest"})]),   # nothing changed
+            reply(calls=[tool_call(3, "run_command", {"command": "pytest"})]),   # still nothing
+            reply(calls=[tool_call(4, "write_file", {"path": "primes.py", "content": "fix"}),
+                         tool_call(5, "run_command", {"command": "pytest"})]),
+            reply(content="step 2 done"),
+        ],
+        command_outputs=[FAIL, FAIL, FAIL, PASS],
+    )
+    assert result["status"] == "done"
+    assert result["reflections"] == 1          # only the first failure was diagnosed
+    assert result["skipped_reflections"] == 2  # the two blind re-runs were skipped
+    kinds = [e["event"] for e in read_log(result["log"])]
+    assert kinds.count("reflection_skipped") == 2
 
 
 def test_loop_stops_at_max_steps(monkeypatch):

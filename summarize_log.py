@@ -26,6 +26,8 @@ for e in events:
     elif kind == "reflection":
         rep = "  (REPEATED)" if e.get("repeated_error") else ""
         print(f"  -> REFLECT [{e['category']} / {e['next_action']}] {e['diagnosis']}{rep}")
+    elif kind == "reflection_skipped":
+        print(f"  -> SKIPPED REFLECT (nothing changed since '{e['command']}' last failed)")
     elif kind == "step_done":
         print(f"  STEP {e['step']} DONE\n")
     elif kind == "json_parse_failed":
@@ -36,4 +38,5 @@ for e in events:
 
 tools = [e for e in events if e["event"] == "tool"]
 refl = [e for e in events if e["event"] == "reflection"]
-print(f"TOTALS  tool calls: {len(tools)}   reflections: {len(refl)}")
+skip = [e for e in events if e["event"] == "reflection_skipped"]
+print(f"TOTALS  tool calls: {len(tools)}   reflections: {len(refl)}   skipped: {len(skip)}")

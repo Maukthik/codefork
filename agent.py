@@ -51,6 +51,7 @@ else:
 
 # ===============================================================
 
+SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "fork-sandbox")  # built from sandbox/Dockerfile
 MAX_STEPS = 25            # total model turns across ALL plan steps (planning adds turns)
 MAX_PLAN_STEPS = 6        # planner may not create more than this
 WORKSPACE = Path("workspace").resolve()
@@ -96,9 +97,12 @@ def run_command(command: str = "", cmd: str = "") -> str:
     cmd_str = actual_command.strip()
     docker_cmd = [
         "docker", "run", "--rm",
+        "--network", "none",            # no internet inside the sandbox
+        "--memory", "512m",             # memory cap
+        "--cpus", "1",                  # CPU cap
         "-v", f"{WORKSPACE.absolute()}:/workspace",
         "-w", "/workspace",
-        "python:3.14-rc-slim",
+        SANDBOX_IMAGE,
         "sh", "-c", cmd_str,
     ]
     try:
@@ -164,6 +168,7 @@ You will be given a PLAN and told which step to work on. Work only on the curren
 Work in small steps: write the code, run it, read the output, and fix any problems.
 Always run your code to verify the step's success check before finishing the step.
 Use only relative file paths.
+The sandbox has Python 3.12 and pytest, but NO internet, so you cannot pip install anything.
 CRITICAL: You ONLY have access to the following tools: `read_file`, `write_file`, and `run_command`. Do not attempt to use or invent any other tools.
 When using `run_command`, ensure the parameter name is 'command'.
 If you receive a REFLECTION message, follow its guidance and never repeat a listed failed approach.
@@ -317,6 +322,9 @@ def run_agent(task: str) -> dict:
     idx = 0                     # which plan step we are on
     failed_approaches = []      # reflector memory - never repeat these
     seen_errors = set()         # detects the exact same error happening twice
+    file_version = 0            # goes up every time the agent writes a file
+    last_failed_at = {}         # command -> file_version when it last failed
+    skipped = 0                 # reflections skipped because nothing changed
 
     # ---- 2. EXECUTE step by step ----
     for turn in range(1, MAX_STEPS + 1):
@@ -351,7 +359,8 @@ def run_agent(task: str) -> dict:
                 print(f"Turns: {turn} | tokens in: {total_in} | tokens out: {total_out}")
                 print(f"Log saved to: {LOG_FILE}")
                 return {"status": "done", "turns": turn, "steps": len(steps),
-                        "reflections": len(failed_approaches), "log": str(LOG_FILE)}
+                        "reflections": len(failed_approaches), "skipped_reflections": skipped,
+                        "tokens_in": total_in, "tokens_out": total_out, "log": str(LOG_FILE)}
             messages.append({"role": "user", "content": step_message(steps, idx)})
             continue
 
@@ -373,6 +382,8 @@ def run_agent(task: str) -> dict:
                  "arguments": tc.function.arguments, "result": result})
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
 
+            if name == "write_file" and not str(result).startswith("ERROR"):
+                file_version += 1
             if command_failed(name, result):
                 failures.append((args.get("command") or args.get("cmd") or "", result))
 
@@ -381,6 +392,20 @@ def run_agent(task: str) -> dict:
         #  to directly follow the assistant message that requested them.)
         if failures:
             command, output = failures[-1]
+
+            # Same command failed before and no file changed since? A new diagnosis
+            # would say the same thing - skip the model call and just nudge the agent.
+            if last_failed_at.get(command) == file_version:
+                skipped += 1
+                print(f"SKIP REFLECT (nothing changed since '{short(command, 60)}' last failed)")
+                log({"event": "reflection_skipped", "turn": turn, "step": steps[idx].id,
+                     "command": command})
+                messages.append({"role": "user", "content":
+                    "You re-ran a command that already failed without changing any file. "
+                    "Change the code (or try a different command) before running it again."})
+                continue
+            last_failed_at[command] = file_version
+
             r = reflect(steps[idx], command, output, failed_approaches)
             failed_approaches.append(f"Step {steps[idx].id}: {r.diagnosis}")
 
@@ -400,7 +425,9 @@ def run_agent(task: str) -> dict:
     print(f"\nStopped: reached the limit of {MAX_STEPS} turns.")
     log({"event": "max_steps", "tokens_in": total_in, "tokens_out": total_out})
     return {"status": "max_steps", "turns": MAX_STEPS, "steps": len(steps),
-            "completed_steps": idx, "reflections": len(failed_approaches), "log": str(LOG_FILE)}
+            "completed_steps": idx, "reflections": len(failed_approaches),
+            "skipped_reflections": skipped, "tokens_in": total_in, "tokens_out": total_out,
+            "log": str(LOG_FILE)}
 
 
 if __name__ == "__main__":
