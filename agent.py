@@ -1,4 +1,4 @@
-"""Project Fork - Autonomous Coding Agent (with Planner + Reflector).
+"""Project Fork - Autonomous Coding Agent (Planner + Reflector + per-stage models + sandbox choice).
 
 Flow:  task -> PLANNER makes steps -> agent loop works step by step
        -> if a command fails, REFLECTOR diagnoses it -> agent retries
@@ -17,6 +17,8 @@ from typing import Literal
 from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
+
+from sandboxes import make_sandbox
 
 load_dotenv()
 
@@ -44,14 +46,26 @@ elif PROVIDER == "openrouter":
 else:
     print("Running in HACKATHON MODE (Cloud Nebius Engine)")
     client = OpenAI(
-        base_url="https://api.tokenfactory.uk-south1.nebius.com/v1",
+        base_url=os.environ.get("NEBIUS_BASE_URL", "https://api.tokenfactory.uk-south1.nebius.com/v1"),
         api_key=os.environ["NEBIUS_API_KEY"],
     )
-    MODEL = os.environ["NEBIUS_MODEL"]   # must be an NVIDIA (Nemotron) model for the hackathon
+    # Must be an NVIDIA (Nemotron) model for the hackathon.
+    MODEL = os.environ.get("NEBIUS_MODEL") or os.environ.get("EXECUTOR_MODEL", "")
+    if not MODEL:
+        raise SystemExit("Set NEBIUS_MODEL (or EXECUTOR_MODEL) in your .env file")
+
+# ===============================================================
+# Per-stage models. Any stage left unset uses MODEL above.
+#   Big model for thinking (planner, reflector), small fast model for doing (executor).
+# ===============================================================
+PLANNER_MODEL = os.environ.get("PLANNER_MODEL") or MODEL
+REFLECTOR_MODEL = os.environ.get("REFLECTOR_MODEL") or MODEL
+EXECUTOR_MODEL = os.environ.get("EXECUTOR_MODEL") or MODEL
+print(f"  planner:   {PLANNER_MODEL}\n  reflector: {REFLECTOR_MODEL}\n  executor:  {EXECUTOR_MODEL}")
 
 # ===============================================================
 
-SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "fork-sandbox")  # built from sandbox/Dockerfile
+SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "fork-sandbox")  # Docker image, built from sandbox/Dockerfile
 MAX_STEPS = 25            # total model turns across ALL plan steps (planning adds turns)
 MAX_PLAN_STEPS = 6        # planner may not create more than this
 WORKSPACE = Path("workspace").resolve()
@@ -59,6 +73,17 @@ WORKSPACE.mkdir(exist_ok=True)
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / f"run_{datetime.datetime.now():%Y%m%d_%H%M%S}.jsonl"
+
+# ===============================================================
+# Sandbox: where code actually runs.  SANDBOX=docker (default) or SANDBOX=nebius
+# ===============================================================
+SANDBOX_KIND = os.environ.get("SANDBOX", "docker").lower()
+SANDBOX = make_sandbox(
+    SANDBOX_KIND, WORKSPACE,
+    docker_image=SANDBOX_IMAGE,
+    nebius_image=os.environ.get("NEBIUS_SANDBOX_IMAGE", "python:3.12-slim"),
+)
+print(f"  sandbox:   {SANDBOX.name}")
 
 
 # ---------------------------------------------------------------
@@ -75,46 +100,37 @@ def safe_path(relative_path: str) -> Path:
 # ---------------------------------------------------------------
 # The three tools   (unchanged)
 # ---------------------------------------------------------------
+def relative(path: str) -> str:
+    """Validate a path (must stay inside the workspace) and return it relative to it."""
+    return safe_path(path).relative_to(WORKSPACE).as_posix()
+
+
 def read_file(path: str) -> str:
-    p = safe_path(path)
-    if not p.exists():
+    text = SANDBOX.read_file(relative(path))
+    if text is None:
         return f"ERROR: {path} does not exist"
-    text = p.read_text(encoding="utf-8")
     if len(text) > 4000:
         return text[:4000] + "\n... [file truncated]"
     return text
 
 
 def write_file(path: str, content: str) -> str:
-    p = safe_path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding="utf-8")
+    SANDBOX.write_file(relative(path), content)
     return f"Wrote {len(content)} characters to {path}"
 
 
 def run_command(command: str = "", cmd: str = "") -> str:
-    actual_command = command or cmd
-    cmd_str = actual_command.strip()
-    docker_cmd = [
-        "docker", "run", "--rm",
-        "--network", "none",            # no internet inside the sandbox
-        "--memory", "512m",             # memory cap
-        "--cpus", "1",                  # CPU cap
-        "-v", f"{WORKSPACE.absolute()}:/workspace",
-        "-w", "/workspace",
-        SANDBOX_IMAGE,
-        "sh", "-c", cmd_str,
-    ]
+    cmd_str = (command or cmd).strip()
     try:
-        result = subprocess.run(
-            docker_cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL
-        )
-    except subprocess.TimeoutExpired:
+        code, out, err = SANDBOX.run(cmd_str)
+    except (subprocess.TimeoutExpired, TimeoutError):
         return "ERROR: command timed out after 30 seconds"
+    except Exception as e:
+        return f"ERROR: sandbox failed: {type(e).__name__}: {e}"
     return (
-        f"exit_code: {result.returncode}\n"
-        f"stdout:\n{result.stdout[-2000:]}\n"
-        f"stderr:\n{result.stderr[-2000:]}"
+        f"exit_code: {code}\n"
+        f"stdout:\n{out[-2000:]}\n"
+        f"stderr:\n{err[-2000:]}"
     )
 
 
@@ -163,12 +179,19 @@ TOOLS = [
     },
 ]
 
-SYSTEM_PROMPT = """You are a coding agent. You complete programming tasks by calling tools.
+SANDBOX_NOTE = (
+    "The sandbox has Python 3.12 and pytest, but NO internet, so you cannot pip install anything."
+    if SANDBOX_KIND == "docker" else
+    "The sandbox has Python 3.12. pytest may not be installed - run tests with `python <test_file>.py`."
+)
+
+SYSTEM_PROMPT = f"""You are a coding agent. You complete programming tasks by calling tools.
 You will be given a PLAN and told which step to work on. Work only on the current step.
 Work in small steps: write the code, run it, read the output, and fix any problems.
 Always run your code to verify the step's success check before finishing the step.
 Use only relative file paths.
-The sandbox has Python 3.12 and pytest, but NO internet, so you cannot pip install anything.
+{SANDBOX_NOTE}
+Keep ALL files in the current folder. Never use /tmp or absolute paths - only the current folder persists between commands.
 CRITICAL: You ONLY have access to the following tools: `read_file`, `write_file`, and `run_command`. Do not attempt to use or invent any other tools.
 When using `run_command`, ensure the parameter name is 'command'.
 If you receive a REFLECTION message, follow its guidance and never repeat a listed failed approach.
@@ -189,6 +212,32 @@ def short(text: str, n: int = 300) -> str:
     return text if len(text) <= n else text[:n] + "..."
 
 
+# ---------------------------------------------------------------
+# Token accounting - counts EVERY model call, split by role
+# ---------------------------------------------------------------
+USAGE = {}
+
+
+def reset_usage() -> None:
+    USAGE.clear()
+    for role in ("planner", "reflector", "executor"):
+        USAGE[role] = {"in": 0, "out": 0, "calls": 0}
+
+
+def track(role: str, response) -> None:
+    USAGE[role]["calls"] += 1
+    if getattr(response, "usage", None):
+        USAGE[role]["in"] += response.usage.prompt_tokens or 0
+        USAGE[role]["out"] += response.usage.completion_tokens or 0
+
+
+def usage_totals() -> tuple[int, int]:
+    return (sum(u["in"] for u in USAGE.values()), sum(u["out"] for u in USAGE.values()))
+
+
+reset_usage()
+
+
 # ===============================================================
 # NEW: shared helper - ask the model for JSON and parse it safely
 # ===============================================================
@@ -203,14 +252,15 @@ def extract_json(text: str) -> dict:
     return json.loads(text[start:end + 1])
 
 
-def ask_json(system: str, user: str, schema: type[BaseModel]):
-    """Call the model WITHOUT tools, expect JSON matching `schema`.
+def ask_json(system: str, user: str, schema: type[BaseModel], model: str, role: str):
+    """Call `model` WITHOUT tools, expect JSON matching `schema`.
     Retries once. Returns a validated object, or None if it keeps failing."""
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     for attempt in range(2):
         reply = client.chat.completions.create(
-            model=MODEL, messages=messages, temperature=0, max_tokens=2000,
+            model=model, messages=messages, temperature=0, max_tokens=2000,
         )
+        track(role, reply)
         text = reply.choices[0].message.content or ""
         try:
             return schema(**extract_json(text))
@@ -245,7 +295,7 @@ Reply with ONLY this JSON, no other text:
 
 
 def make_plan(task: str) -> list[Step]:
-    plan = ask_json(PLANNER_PROMPT, f"Task: {task}", Plan)
+    plan = ask_json(PLANNER_PROMPT, f"Task: {task}", Plan, model=PLANNER_MODEL, role="planner")
     if plan is None or not plan.steps:
         # Fallback: never block the agent just because planning failed
         steps = [Step(id=1, description=task, success_check="The code runs and the task is satisfied")]
@@ -293,7 +343,7 @@ def reflect(step: Step, command: str, output: str, failed: list[str]) -> Reflect
             f"Command: {command}\n"
             f"Output (end):\n{output[-1500:]}\n"
             f"Already failed:\n" + ("\n".join(f"- {f}" for f in failed) or "- none"))
-    r = ask_json(REFLECTOR_PROMPT, user, Reflection)
+    r = ask_json(REFLECTOR_PROMPT, user, Reflection, model=REFLECTOR_MODEL, role="reflector")
     if r is None:
         r = Reflection(diagnosis="Command failed; see the error output.",
                        category="other", next_action="fix_code")
@@ -303,9 +353,32 @@ def reflect(step: Step, command: str, output: str, failed: list[str]) -> Reflect
 # ===============================================================
 # The agent loop (now plan-driven, with reflection)
 # ===============================================================
+def finish_sandbox() -> int:
+    """Nebius: copy files back to the local workspace. Docker: nothing to do."""
+    try:
+        copied = SANDBOX.finish()
+    except Exception as e:
+        print(f"Could not copy files back from the sandbox: {e}")
+        log({"event": "sandbox_sync_failed", "error": str(e)})
+        return 0
+    if copied:
+        print(f"Copied {copied} file(s) from the {SANDBOX.name} sandbox into workspace/")
+    return copied
+
+
 def run_agent(task: str) -> dict:
-    total_in = total_out = 0
-    log({"event": "task", "task": task, "provider": PROVIDER, "model": MODEL})
+    reset_usage()
+    log({"event": "task", "task": task, "provider": PROVIDER, "model": EXECUTOR_MODEL,
+         "planner": PLANNER_MODEL, "reflector": REFLECTOR_MODEL, "executor": EXECUTOR_MODEL,
+         "sandbox": SANDBOX.name})
+
+    # ---- 0. SANDBOX ----
+    try:
+        SANDBOX.start()
+    except Exception as e:
+        print(f"Sandbox failed to start: {type(e).__name__}: {e}")
+        log({"event": "sandbox_error", "error": str(e)})
+        return {"status": "sandbox_error", "error": str(e), "log": str(LOG_FILE)}
 
     # ---- 1. PLAN ----
     steps = make_plan(task)
@@ -330,13 +403,11 @@ def run_agent(task: str) -> dict:
     for turn in range(1, MAX_STEPS + 1):
         print(f"\n===== Turn {turn} | Step {steps[idx].id}/{len(steps)} =====")
         response = client.chat.completions.create(
-            model=MODEL, messages=messages, tools=TOOLS,
+            model=EXECUTOR_MODEL, messages=messages, tools=TOOLS,
             temperature=0, max_tokens=4000,
         )
+        track("executor", response)
         msg = response.choices[0].message
-        if response.usage:
-            total_in += response.usage.prompt_tokens
-            total_out += response.usage.completion_tokens
 
         assistant_msg = {"role": "assistant", "content": msg.content or ""}
         if msg.tool_calls:
@@ -353,14 +424,19 @@ def run_agent(task: str) -> dict:
             log({"event": "step_done", "step": steps[idx].id, "summary": msg.content})
             idx += 1
             if idx >= len(steps):
+                finish_sandbox()
+                total_in, total_out = usage_totals()
                 print("\nALL STEPS COMPLETE")
                 log({"event": "finish", "turns": turn, "tokens_in": total_in, "tokens_out": total_out,
-                     "failed_approaches": failed_approaches})
+                     "usage": USAGE, "failed_approaches": failed_approaches})
                 print(f"Turns: {turn} | tokens in: {total_in} | tokens out: {total_out}")
+                for role, u in USAGE.items():
+                    print(f"  {role:<9} calls: {u['calls']:>2}  in: {u['in']:>6}  out: {u['out']:>5}")
                 print(f"Log saved to: {LOG_FILE}")
                 return {"status": "done", "turns": turn, "steps": len(steps),
                         "reflections": len(failed_approaches), "skipped_reflections": skipped,
-                        "tokens_in": total_in, "tokens_out": total_out, "log": str(LOG_FILE)}
+                        "tokens_in": total_in, "tokens_out": total_out,
+                        "usage": {k: dict(v) for k, v in USAGE.items()}, "log": str(LOG_FILE)}
             messages.append({"role": "user", "content": step_message(steps, idx)})
             continue
 
@@ -422,12 +498,14 @@ def run_agent(task: str) -> dict:
                  **r.model_dump(), "repeated_error": repeated})
             messages.append({"role": "user", "content": note})
 
+    finish_sandbox()
+    total_in, total_out = usage_totals()
     print(f"\nStopped: reached the limit of {MAX_STEPS} turns.")
-    log({"event": "max_steps", "tokens_in": total_in, "tokens_out": total_out})
+    log({"event": "max_steps", "tokens_in": total_in, "tokens_out": total_out, "usage": USAGE})
     return {"status": "max_steps", "turns": MAX_STEPS, "steps": len(steps),
             "completed_steps": idx, "reflections": len(failed_approaches),
             "skipped_reflections": skipped, "tokens_in": total_in, "tokens_out": total_out,
-            "log": str(LOG_FILE)}
+            "usage": {k: dict(v) for k, v in USAGE.items()}, "log": str(LOG_FILE)}
 
 
 if __name__ == "__main__":

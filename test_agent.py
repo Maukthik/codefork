@@ -10,14 +10,23 @@ import types
 import pytest
 
 # agent.py reads these at import time - set fakes BEFORE importing it
-os.environ.update({"PROVIDER": "nebius", "NEBIUS_API_KEY": "test", "NEBIUS_MODEL": "fake"})
+os.environ.update({"PROVIDER": "nebius", "NEBIUS_API_KEY": "test", "NEBIUS_MODEL": "fake",
+                   "SANDBOX": "docker"})
+for key in ("PLANNER_MODEL", "REFLECTOR_MODEL", "EXECUTOR_MODEL"):
+    os.environ.pop(key, None)
 import agent  # noqa: E402
+import sandboxes  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def isolated_log(monkeypatch, tmp_path):
-    """Every test writes its log to a temporary folder, never to your real logs/."""
+def isolated(monkeypatch, tmp_path):
+    """Every test uses a temporary workspace and log - never your real workspace/ or logs/."""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
     monkeypatch.setattr(agent, "LOG_FILE", tmp_path / "run.jsonl")
+    monkeypatch.setattr(agent, "WORKSPACE", ws.resolve())
+    monkeypatch.setattr(agent, "SANDBOX", sandboxes.DockerSandbox(ws.resolve(), "fork-sandbox"))
+    return ws
 
 
 # ---------- helpers that build fake model replies ----------
@@ -176,3 +185,135 @@ def test_loop_stops_at_max_steps(monkeypatch):
         command_outputs=[ok] * 10,
     )
     assert result["status"] == "max_steps" and result["completed_steps"] == 0
+
+
+def test_each_stage_uses_its_own_model_and_tokens_are_counted(monkeypatch):
+    monkeypatch.setattr(agent, "PLANNER_MODEL", "big-planner")
+    monkeypatch.setattr(agent, "REFLECTOR_MODEL", "big-reflector")
+    monkeypatch.setattr(agent, "EXECUTOR_MODEL", "small-executor")
+    outputs = iter([FAIL, PASS])
+    monkeypatch.setitem(agent.FUNCTIONS, "run_command", lambda command="", cmd="": next(outputs))
+    script = iter([
+        reply(content="step 1 done"),
+        reply(calls=[tool_call(1, "run_command", {"command": "pytest"})]),
+        reply(calls=[tool_call(2, "write_file", {"path": "a.py", "content": "x"}),
+                     tool_call(3, "run_command", {"command": "pytest"})]),
+        reply(content="step 2 done"),
+    ])
+    used = []
+
+    def fake_create(**kw):
+        used.append(kw["model"])
+        if "tools" not in kw:
+            content = PLAN if "planning module" in kw["messages"][0]["content"] else REFLECTION
+            r = reply(content=content)
+        else:
+            r = next(script)
+        r.usage = types.SimpleNamespace(prompt_tokens=100, completion_tokens=10)
+        return r
+
+    monkeypatch.setattr(agent.client.chat.completions, "create", fake_create)
+    result = agent.run_agent("task")
+
+    assert used[0] == "big-planner"
+    assert "big-reflector" in used
+    assert set(used) == {"big-planner", "big-reflector", "small-executor"}
+    u = result["usage"]
+    assert u["planner"]["calls"] == 1 and u["reflector"]["calls"] == 1 and u["executor"]["calls"] == 4
+    assert result["tokens_in"] == 100 * 6          # all 6 calls counted, not just executor
+
+
+# ======================================================================
+# Nebius Sandboxes backend - tested with a fake snapshot object
+# (same methods the real contree-sdk image has: run, wait, apply_files, read)
+# ======================================================================
+class FakeSnapshot:
+    """Pretends to be a Nebius snapshot. `handler(cmd, fs)` decides what a command does."""
+    calls = []
+
+    def __init__(self, fs=None, handler=None):
+        self.fs = dict(fs or {})
+        self.handler = handler
+        self.exit_code, self.stdout, self.stderr = 0, "", ""
+
+    def run(self, command=None, *, shell=None, cwd=None, disposable=True, timeout=None, **kw):
+        FakeSnapshot.calls.append({"shell": shell, "cwd": cwd, "disposable": disposable})
+        child = FakeSnapshot(self.fs, self.handler)
+        if shell.startswith("find "):
+            child.stdout = "\n".join("./" + p.removeprefix("/workspace/")
+                                      for p in child.fs if p.startswith("/workspace/"))
+        elif shell.startswith("mkdir"):
+            pass
+        elif self.handler:
+            child.exit_code, child.stdout, child.stderr = self.handler(shell, child.fs)
+        return child
+
+    def wait(self):
+        return self
+
+    def apply_files(self, files):
+        return FakeSnapshot({**self.fs, **files}, self.handler)
+
+    def read(self, path):
+        if path not in self.fs:
+            raise FileNotFoundError(path)
+        return self.fs[path]
+
+
+def make_fake_nebius(ws, handler=None):
+    sb = sandboxes.NebiusSandbox(ws, "python:3.12-slim")
+    sb.sdk = object()                 # pretend we're already connected
+    sb.base = FakeSnapshot(handler=handler)
+    return sb
+
+
+def test_nebius_start_uploads_local_workspace(isolated):
+    (isolated / "primes.py").write_text("def is_prime(n): return n > 1")
+    (isolated / "__pycache__").mkdir()
+    (isolated / "__pycache__" / "junk.pyc").write_bytes(b"x")
+    sb = make_fake_nebius(isolated)
+    sb.start()
+    assert sb.state.fs == {"/workspace/primes.py": b"def is_prime(n): return n > 1"}
+
+
+def test_nebius_write_read_and_state_chaining(isolated):
+    def handler(cmd, fs):          # "python" appends a file, like a real program would
+        fs["/workspace/out.txt"] = b"hello"
+        return 0, "ran", ""
+    sb = make_fake_nebius(isolated, handler)
+    sb.start()
+    sb.write_file("a.py", "print(1)")
+    assert sb.read_file("a.py") == "print(1)"
+    assert sb.read_file("missing.py") is None
+    code, out, err = sb.run("python a.py")
+    assert (code, out) == (0, "ran")
+    assert sb.read_file("out.txt") == "hello"       # next step sees the previous command's files
+    assert FakeSnapshot.calls[-1]["cwd"] == "/workspace"
+    assert FakeSnapshot.calls[-1]["disposable"] is False
+
+
+def test_nebius_finish_copies_files_back(isolated):
+    sb = make_fake_nebius(isolated)
+    sb.start()
+    sb.write_file("pkg/mod.py", "x = 1")
+    assert sb.finish() == 1
+    assert (isolated / "pkg" / "mod.py").read_text() == "x = 1"
+
+
+def test_agent_tools_use_nebius_backend(isolated, monkeypatch):
+    sb = make_fake_nebius(isolated, lambda cmd, fs: (1, "", "AssertionError"))
+    sb.start()
+    monkeypatch.setattr(agent, "SANDBOX", sb)
+    assert agent.write_file("t.py", "assert False").startswith("Wrote")
+    assert agent.read_file("t.py") == "assert False"
+    assert agent.command_failed("run_command", agent.run_command("python t.py"))
+    assert not (isolated / "t.py").exists()          # nothing written locally until finish()
+    with pytest.raises(ValueError):
+        agent.write_file("../escape.py", "x")        # path jail still applies
+
+
+def test_missing_project_id_gives_clear_error(isolated, monkeypatch):
+    monkeypatch.delenv("NEBIUS_PROJECT_ID", raising=False)
+    sb = sandboxes.NebiusSandbox(isolated, "python:3.12-slim")
+    with pytest.raises(RuntimeError, match="NEBIUS_PROJECT_ID"):
+        sb.start()

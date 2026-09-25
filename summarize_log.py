@@ -14,7 +14,11 @@ print(f"Log: {path}\n")
 for e in events:
     kind = e["event"]
     if kind == "task":
-        print(f"TASK   {e['task']}\nMODEL  {e.get('provider', '?')} / {e['model']}\n")
+        print(f"TASK   {e['task']}")
+        if "planner" in e:
+            print(f"MODELS planner={e['planner']}  reflector={e['reflector']}  executor={e['executor']}\n")
+        else:
+            print(f"MODEL  {e.get('provider', '?')} / {e.get('model', '?')}\n")
     elif kind == "plan":
         print("PLAN" + ("  (FALLBACK - planner failed)" if e.get("fallback") else ""))
         for s in e["steps"]:
@@ -35,6 +39,8 @@ for e in events:
     elif kind in ("finish", "max_steps"):
         status = "SUCCESS" if kind == "finish" else "STOPPED AT LIMIT"
         print(f"\nRESULT  {status}   tokens in/out: {e.get('tokens_in')}/{e.get('tokens_out')}")
+        for role, u in (e.get("usage") or {}).items():
+            print(f"  {role:<9} calls: {u['calls']:>2}  in: {u['in']:>6}  out: {u['out']:>5}")
 
 tools = [e for e in events if e["event"] == "tool"]
 refl = [e for e in events if e["event"] == "reflection"]
