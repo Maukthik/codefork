@@ -31,27 +31,25 @@ Give Project Fork a task in plain English, for example *"write a function that p
 ## 🧠 How it works
 
 ```mermaid
-flowchart LR
-    T([📝 Task]) --> P[🧭 Planner]
-    P -->|up to 6 steps| E[🛠️ Executor]
-    E -->|write_file / read_file / run_command| S[(📦 Sandbox<br/>Docker or Nebius)]
-    S -->|output| E
-    E -->|command failed<br/>after a code change| R[🔍 Reflector]
-    R -->|diagnosis + failed approaches| E
-    E -->|all steps done| W([✅ workspace/ + JSONL log])
+flowchart TD
+    task([Your task]) --> planner[Planner]
+    planner -- "plan: up to 6 steps" --> executor[Executor]
+    executor <-- "write · read · run" --> sandbox[(Sandbox)]
+    executor -- "a command failed" --> reflector[Reflector]
+    reflector -- "diagnosis" --> executor
+    executor -- "all steps done" ----> result([Files in workspace/])
 ```
 
-| Stage | Role | Output |
-|---|---|---|
-| **Planner** | Splits the task into at most 6 steps | A `Plan` validated with Pydantic (falls back safely if the model returns garbage) |
-| **Executor** | Tool-calling loop over the plan | Files and command runs in the sandbox |
-| **Reflector** | Diagnoses failed commands | Category, next action and a running list of failed approaches |
+1. **Planner** turns your task into up to 6 small steps, each with a success check.
+2. **Executor** works through the steps one at a time, writing files and running commands in the **sandbox**.
+3. **Reflector** steps in when a command fails. It explains what went wrong and keeps a list of approaches that already failed, so the executor tries something new.
+4. When every step is done, the files are copied to `workspace/` and the whole run is saved to `logs/`.
 
-**Guardrails**
-- 🔒 Every file path is checked so the agent can't write outside its workspace.
-- ⏱️ Hard limit of **25 model turns** per task.
-- 🧮 Token usage is counted separately for planner, reflector and executor.
-- 💤 Re-running a failed command without changing any code does **not** call the reflector, which saves tokens.
+**Built-in safety**
+- 🔒 The agent can't read or write files outside its workspace.
+- ⏱️ Each task is capped at **25 model turns**.
+- 🧮 Token usage is tracked separately for each stage.
+- 💤 If the agent re-runs a failed command without changing any code, the reflector isn't called again, which saves tokens.
 
 ## 📦 Sandboxes
 
@@ -87,46 +85,46 @@ Generated code is written to `workspace/`, and run logs go to `logs/run_<timesta
 
 ## ⚙️ Configuration
 
-All settings live in `.env`.
+Copy `.env.example` to `.env` and fill it in. A typical setup (Nemotron on Nebius, code running in local Docker) needs only four lines:
 
-<details open>
-<summary><b>Model provider</b></summary>
+```ini
+PROVIDER=nebius
+NEBIUS_API_KEY=your-key-here
+NEBIUS_MODEL=a-nemotron-model-from-list_models.py
+SANDBOX=docker
+```
 
-| Variable | Default | Description |
+Everything else is optional.
+
+### 1. Where the model runs
+
+| Variable | Needed when | Default |
 |---|---|---|
-| `PROVIDER` | `ollama` | `ollama` (local), `openrouter`, or `nebius` |
-| `NEBIUS_API_KEY` | – | Nebius Token Factory key |
-| `NEBIUS_MODEL` | – | Main model (an NVIDIA Nemotron model for the hackathon) |
-| `NEBIUS_BASE_URL` | Token Factory UK-South | Override the API endpoint |
-| `OPENROUTER_API_KEY` / `OPENROUTER_MODEL` | – | For `PROVIDER=openrouter` |
-| `OLLAMA_URL` / `OLLAMA_MODEL` | `localhost:11434` / `llama3.1:8b-instruct-q4_K_M` | For `PROVIDER=ollama` |
+| `PROVIDER` | always | `ollama` |
+| `NEBIUS_API_KEY` | `PROVIDER=nebius` | – |
+| `NEBIUS_MODEL` | `PROVIDER=nebius` | – |
+| `NEBIUS_BASE_URL` | using a different Nebius region | UK-South endpoint |
+| `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` | `PROVIDER=openrouter` | – |
+| `OLLAMA_URL`, `OLLAMA_MODEL` | `PROVIDER=ollama` | `http://localhost:11434/v1`, `llama3.1:8b-instruct-q4_K_M` |
 
-</details>
+### 2. A different model per stage *(optional)*
 
-<details>
-<summary><b>Per-stage models</b> (optional)</summary>
+Leave these blank to use the main model for everything.
 
-Each stage can use its own model. Any stage left unset uses the main model.
-
-| Variable | Stage |
+| Variable | Used by |
 |---|---|
 | `PLANNER_MODEL` | Planner |
-| `REFLECTOR_MODEL` | Reflector |
 | `EXECUTOR_MODEL` | Executor |
+| `REFLECTOR_MODEL` | Reflector |
 
-</details>
+### 3. Where the code runs
 
-<details>
-<summary><b>Sandbox</b></summary>
-
-| Variable | Default | Description |
+| Variable | Needed when | Default |
 |---|---|---|
-| `SANDBOX` | `docker` | `docker` or `nebius` |
-| `SANDBOX_IMAGE` | `fork-sandbox` | Docker image built from `sandbox/` |
-| `NEBIUS_SANDBOX_IMAGE` | `python:3.12-slim` | Image for Nebius Sandboxes |
-| `NEBIUS_PROJECT_ID` | – | Required when `SANDBOX=nebius` |
-
-</details>
+| `SANDBOX` | always | `docker` |
+| `SANDBOX_IMAGE` | using a custom Docker image | `fork-sandbox` |
+| `NEBIUS_PROJECT_ID` | `SANDBOX=nebius` | – |
+| `NEBIUS_SANDBOX_IMAGE` | using a custom Nebius image | `python:3.12-slim` |
 
 ## 🧪 Tests
 
