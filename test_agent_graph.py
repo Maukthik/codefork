@@ -38,7 +38,7 @@ def make_fake_chat(plans):
     state = {"planner": 0}
     lock = threading.Lock()
 
-    def fake_chat(model, messages, tools=None):
+    def fake_chat(model, messages, tools=None, **kwargs):
         system = messages[0]["content"]
         if "planner" in system:
             with lock:
@@ -47,8 +47,8 @@ def make_fake_chat(plans):
             return msg(json.dumps({"strategies": strategies})), (100, 20)
         if "reflector" in system:
             return msg("All attempts used the wrong operator."), (50, 10)
-        # executor: first turn writes a file, second turn stops
-        if messages[-1]["role"] == "tool":
+        # executor: first turn writes a file, next turn stops
+        if any(m["role"] == "assistant" for m in messages):
             return msg("done"), (30, 5)
         good = "GOOD" in messages[1]["content"]
         return msg("", [call("write_file", path="calc.py", content=FIXED if good else WRONG)]), (40, 10)
@@ -275,3 +275,91 @@ def test_llm_client_not_shadowed(monkeypatch):
     monkeypatch.setattr(ag, "_client", None)
     monkeypatch.setenv("PROVIDER", "ollama")
     assert hasattr(ag.get_client(), "chat")
+
+
+# --- speed pass + trajectories ---------------------------------------------------
+
+import time as _time
+
+
+def test_branch_stops_as_soon_as_auto_test_passes(repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(ag, "chat", make_fake_chat([["GOOD fix"]]))
+    s = ag.run(str(repo), "fix", branches=1, rounds=1, max_turns=10,
+               work_root=str(tmp_path / "b"), full=True)
+    r = s["results"][0]
+    assert r["passed"] and r["turns"] == 1 and r["stop_reason"] == "tests passed"
+
+
+def test_first_green_cancels_slow_branches(repo, tmp_path, monkeypatch):
+    def slow_chat(model, messages, tools=None, **kw):
+        system = messages[0]["content"]
+        if "planner" in system:
+            return msg(json.dumps({"strategies": ["GOOD fix", "slow bad"]})), (1, 1)
+        if "GOOD" in messages[1]["content"]:
+            return msg("", [call("write_file", path="calc.py", content=FIXED)]), (1, 1)
+        _time.sleep(0.4)  # the bad branch keeps writing wrong code forever
+        return msg("", [call("write_file", path="calc.py", content=WRONG)]), (1, 1)
+    monkeypatch.setattr(ag, "chat", slow_chat)
+    s = ag.run(str(repo), "fix", branches=2, rounds=1, max_turns=20,
+               work_root=str(tmp_path / "b"), full=True)
+    by = {r["branch_id"]: r for r in s["results"]}
+    assert by["r1_b0"]["passed"]
+    assert by["r1_b1"]["cancelled"] and by["r1_b1"]["turns"] < 20
+    assert s["summary"]["status"] == "green"
+
+
+def test_all_branches_mode_does_not_cancel(repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(ag, "chat", make_fake_chat([["GOOD fix", "bad"]]))
+    s = ag.run(str(repo), "fix", branches=2, rounds=1, first_green=False,
+               work_root=str(tmp_path / "b"), full=True)
+    assert not any(r["cancelled"] for r in s["results"])
+
+
+def test_truncated_reply_is_not_applied(repo, tmp_path, monkeypatch):
+    seen = {"n": 0}
+    def trunc_chat(model, messages, tools=None, **kw):
+        if "planner" in messages[0]["content"]:
+            return msg(json.dumps({"strategies": ["GOOD fix"]})), (1, 1)
+        seen["n"] += 1
+        if seen["n"] == 1:   # cut off mid tool call: must not be executed
+            m = msg("", [call("write_file", path="calc.py", content=WRONG)])
+            m.finish_reason = "length"
+            return m, (1, 1)
+        assert "cut off" in messages[-1]["content"]
+        return msg("", [call("write_file", path="calc.py", content=FIXED)]), (1, 1)
+    monkeypatch.setattr(ag, "chat", trunc_chat)
+    s = ag.run(str(repo), "fix", branches=1, rounds=1, work_root=str(tmp_path / "b"), full=True)
+    assert s["results"][0]["passed"] and s["results"][0]["turns"] == 2
+
+
+def test_winning_trajectory_saved(repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(ag, "chat", make_fake_chat([["bad", "GOOD fix"]]))
+    s = ag.run(str(repo), "fix add", branches=2, rounds=1, work_root=str(tmp_path / "b"))
+    files = list((tmp_path / "logs" / "trajectories").glob("*.json"))
+    assert s["trajectories_saved"] == 1 and len(files) == 1
+    rec = json.loads(files[0].read_text())
+    assert rec["winner"] and rec["messages"][0]["role"] == "system" and rec["tools"]
+
+
+def test_repo_context_puts_mentioned_files_first(tmp_path):
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "calc.py").write_text(BUGGY)
+    ctx = ag.repo_context(str(tmp_path), "FAILED test_calc.py ... calc.py:2")
+    assert ctx.index("### calc.py") < ctx.index("### a.py")
+    small = ag.repo_context(str(tmp_path), "", budget=40)
+    assert "Other files" in small
+
+
+def test_thinking_switch_falls_back_if_provider_rejects(monkeypatch):
+    class Completions:
+        def create(self, **kw):
+            if "extra_body" in kw:
+                raise ValueError("unknown field")
+            m = SimpleNamespace(content="ok", tool_calls=None)
+            return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+                                   choices=[SimpleNamespace(message=m, finish_reason="stop")])
+    fake = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    monkeypatch.setattr(ag, "get_client", lambda: fake)
+    monkeypatch.setattr(ag, "_thinking_unsupported", False)
+    m, usage = ag.chat("m", [{"role": "user", "content": "hi"}], thinking="off", max_tokens=100)
+    assert m.content == "ok" and ag._thinking_unsupported

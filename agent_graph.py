@@ -37,6 +37,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Optional, TypedDict
 
 from dotenv import load_dotenv
@@ -113,16 +114,42 @@ def get_client():
     return _client
 
 
-def chat(model: str, messages: list, tools: Optional[list] = None):
+EXECUTOR_MAX_TOKENS = int(os.getenv("EXECUTOR_MAX_TOKENS", "8192"))
+_thinking_unsupported = False
+
+
+def chat(model: str, messages: list, tools: Optional[list] = None,
+         max_tokens: Optional[int] = None, thinking: Optional[str] = None):
     """Single LLM call. Returns (message, (input_tokens, output_tokens)).
-    Tests monkeypatch this function."""
+    message has .content, .tool_calls and .finish_reason ("length" = cut off by max_tokens).
+    thinking: None/"on" = model default, "off" = no reasoning, "low" = brief reasoning
+    (Nemotron 3 chat_template_kwargs). Tests monkeypatch this function."""
+    global _thinking_unsupported
     kwargs = {"model": model, "messages": messages, "temperature": 0.2}
     if tools:
         kwargs["tools"] = tools
-    resp = get_client().chat.completions.create(**kwargs)
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
+    if thinking in ("off", "low") and not _thinking_unsupported:
+        ctk = {"enable_thinking": thinking == "low"}
+        if thinking == "low":
+            ctk["low_effort"] = True
+        kwargs["extra_body"] = {"chat_template_kwargs": ctk}
+    try:
+        resp = get_client().chat.completions.create(**kwargs)
+    except Exception as e:
+        if "extra_body" not in kwargs:
+            raise
+        log(f"[llm] provider rejected the thinking switch ({type(e).__name__}); using model default")
+        _thinking_unsupported = True
+        kwargs.pop("extra_body")
+        resp = get_client().chat.completions.create(**kwargs)
     u = resp.usage
     usage = (getattr(u, "prompt_tokens", 0) or 0, getattr(u, "completion_tokens", 0) or 0)
-    return resp.choices[0].message, usage
+    choice = resp.choices[0]
+    m = choice.message
+    return SimpleNamespace(content=m.content, tool_calls=m.tool_calls,
+                           finish_reason=choice.finish_reason), usage
 
 
 def parse_json(text: str):
@@ -303,6 +330,26 @@ def list_files(root: str) -> list[str]:
     return sorted(collect_files(root).keys())
 
 
+def repo_context(root: str, failing_output: str = "", budget: int = 30000) -> str:
+    """The repo's key files inline, so agents don't spend turns reading them.
+    Files named in the failing output come first, then small .py files, within a char budget."""
+    files = collect_files(root)
+    def rank(rel):
+        mentioned = Path(rel).name in failing_output
+        return (0 if mentioned else 1, 0 if rel.endswith(".py") else 1, len(files[rel]))
+    parts, used, skipped = [], 0, []
+    for rel in sorted(files, key=rank):
+        block = f"### {rel}\n```\n{files[rel]}\n```\n"
+        if used + len(block) > budget:
+            skipped.append(rel)
+            continue
+        parts.append(block)
+        used += len(block)
+    if skipped:
+        parts.append("Other files (use read_file if needed): " + ", ".join(sorted(skipped)))
+    return "\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Executor tools
 # ---------------------------------------------------------------------------
@@ -361,6 +408,8 @@ class GraphState(TypedDict, total=False):
     max_turns: int
     apply: bool
     make_branch: bool
+    first_green: bool
+    thinking: Optional[str]
 
     baseline_passed: bool
     baseline_output: str
@@ -392,6 +441,7 @@ PLANNER_PROMPT = """You are the planner for an autonomous coding agent that fixe
 Propose exactly {n} DIFFERENT strategies to make the tests pass. Each strategy should be a short,
 concrete instruction (1-3 sentences) naming the files/functions to look at and the fix idea.
 Make them genuinely different (different root-cause hypotheses or approaches), not rewordings.
+Base every strategy on the actual code shown; don't guess at bugs you can't see in it.
 Never suggest editing or deleting tests to make them pass.
 Reply ONLY with JSON: {{"strategies": ["...", "..."]}}"""
 
@@ -399,7 +449,8 @@ Reply ONLY with JSON: {{"strategies": ["...", "..."]}}"""
 def planner_node(state: GraphState) -> dict:
     n = state["n_branches"]
     rnd = state.get("round", 0) + 1
-    user = (f"Task: {state['task']}\n\nFiles:\n{chr(10).join(list_files(state['repo_dir']))}\n\n"
+    user = (f"Task: {state['task']}\n\nRepo files:\n"
+            f"{repo_context(state['repo_dir'], state['baseline_output'])}\n\n"
             f"Failing test output:\n{state['baseline_output']}")
     if state.get("feedback"):
         user += f"\n\nFeedback from the previous round (these attempts failed):\n{state['feedback']}"
@@ -433,50 +484,87 @@ def fan_out(state: GraphState) -> list[Send]:
             "work_root": state["work_root"],
             "run_id": state["run_id"],
             "max_turns": state["max_turns"],
+            "first_green": state.get("first_green", True),
+            "thinking": state.get("thinking"),
         })
         for k, s in enumerate(state["strategies"])
     ]
 
 
 EXECUTOR_PROMPT = """You are the executor of an autonomous coding agent. You work inside a copy of a Python repo.
-Tools: list_files, read_file, write_file, run_command. Commands run in a fresh sandbox each time:
-file changes made by shell commands (sed, echo >, pip install) are NOT kept. Make every edit with write_file.
+Tools: list_files, read_file, write_file, run_command. The repo's key files are included below.
 Goal: make the test command pass by fixing the source code. Do NOT edit or delete tests.
-Follow the strategy you are given. Keep changes minimal. Run the tests to check your fix.
+Follow the strategy you are given. Keep changes minimal.
+
+RULES:
+- Make EVERY edit with write_file, passing the complete new file content.
+- NEVER edit files with shell commands (sed, echo >, cat <<EOF, python -c, pip install).
+  Each command runs in a fresh sandbox, so those changes are thrown away.
+- After each write_file, the tests run automatically and you'll see the result.
+  You don't need to run them yourself.
 When the tests pass (or you cannot make progress), reply with a short summary and no tool calls."""
+
+
+_cancel_events: dict[str, threading.Event] = {}
+
+
+def _cancel_event(key: str) -> threading.Event:
+    with _cache_lock:
+        return _cancel_events.setdefault(key, threading.Event())
 
 
 def executor_node(payload: dict) -> dict:
     bid = payload["branch_id"]
     workdir = str(Path(payload["work_root"]) / payload["run_id"] / bid)
     copy_repo(payload["repo_dir"], workdir)
+    test_cmd = payload["test_cmd"].strip()
+    first_green = payload.get("first_green", True)
+    cancel = _cancel_event(f"{payload['run_id']}:{payload['round']}")
 
     messages = [
         {"role": "system", "content": EXECUTOR_PROMPT},
         {"role": "user", "content": (
-            f"Task: {payload['task']}\nTest command: {payload['test_cmd']}\n"
-            f"Strategy: {payload['strategy']}\n\nFailing output:\n{payload['baseline_output']}")},
+            f"Task: {payload['task']}\nTest command: {test_cmd}\n"
+            f"Strategy: {payload['strategy']}\n\n"
+            f"Repo files:\n{repo_context(payload['repo_dir'], payload['baseline_output'])}\n\n"
+            f"Failing output:\n{payload['baseline_output']}")},
     ]
     model = stage_model("executor")
     tin = tout = turns = tool_calls = 0
+    verified = None          # (code, output) once the tests have passed
+    stop = "gave up"
     t0 = time.time()
 
     for turns in range(1, payload["max_turns"] + 1):
+        if first_green and cancel.is_set():
+            stop = "cancelled"
+            break
         try:
-            msg, (i, o) = chat(model, messages, TOOLS)
+            msg, (i, o) = chat(model, messages, TOOLS, max_tokens=EXECUTOR_MAX_TOKENS,
+                               thinking=payload.get("thinking"))
         except Exception as e:
             log(f"[{bid}] LLM error: {e}")
             break
         tin, tout = tin + i, tout + o
         calls = getattr(msg, "tool_calls", None) or []
+
+        if getattr(msg, "finish_reason", None) == "length":
+            log(f"[{bid}] turn {turns}: reply cut off at max_tokens, asking for smaller edits")
+            messages.append({"role": "user", "content": (
+                "Your last reply was cut off because it was too long, so nothing was applied. "
+                "Write one file per call and keep your reasoning short.")})
+            continue
         if not calls:
+            stop = "model finished"
             break
+
         messages.append({
             "role": "assistant", "content": msg.content or "",
             "tool_calls": [{"id": c.id, "type": "function",
                             "function": {"name": c.function.name, "arguments": c.function.arguments}}
                            for c in calls],
         })
+        wrote = False
         for c in calls:
             tool_calls += 1
             try:
@@ -488,22 +576,55 @@ def executor_node(payload: dict) -> dict:
             first = result.splitlines()[0] if result else ""
             log(f"[{bid}] turn {turns}: {c.function.name} {shown} -> {first[:80]}")
             messages.append({"role": "tool", "tool_call_id": c.id, "content": result})
+            if c.function.name == "write_file" and result.startswith("Wrote"):
+                wrote = True
+            if (c.function.name == "run_command" and test_cmd in args.get("command", "")
+                    and result.startswith("exit code 0")):
+                verified = (0, result)
 
-    try:
-        code, out = run_in_sandbox(workdir, payload["test_cmd"])  # final check is the judge
-    except Exception as e:
-        code, out = 1, f"Sandbox error: {type(e).__name__}: {e}"
-    diff = make_diff(payload["repo_dir"], workdir)
+        if wrote and not verified:  # auto-run tests after edits: saves a turn per check
+            try:
+                code, out = run_in_sandbox(workdir, test_cmd)
+            except Exception as e:
+                code, out = 1, f"Sandbox error: {type(e).__name__}: {e}"
+            if code == 0:
+                verified = (0, out)
+            else:
+                messages.append({"role": "user", "content":
+                                 f"[auto test run after your edit] exit code {code}\n{tail(out, 1500)}"})
+            log(f"[{bid}] turn {turns}: auto test -> {'GREEN' if code == 0 else f'exit {code}'}")
+        if verified:
+            stop = "tests passed"
+            if first_green:
+                cancel.set()
+            break
+
+    cancelled = stop == "cancelled"
+    if verified:
+        code, out = verified
+    elif cancelled:
+        code, out = 1, "Stopped: another branch turned the tests green first."
+    else:
+        try:
+            code, out = run_in_sandbox(workdir, test_cmd)  # final check is the judge
+        except Exception as e:
+            code, out = 1, f"Sandbox error: {type(e).__name__}: {e}"
     passed = code == 0
-    log(f"[{bid}] {'GREEN' if passed else 'red'} | turns {turns} | tools {tool_calls} | "
-          f"diff {diff['lines']} lines | tokens {tin}+{tout} | {time.time() - t0:.0f}s")
+    if passed and first_green:
+        cancel.set()
+    diff = make_diff(payload["repo_dir"], workdir)
+    status = "GREEN" if passed else ("stopped" if cancelled else "red")
+    log(f"[{bid}] {status} ({stop}) | turns {turns} | tools {tool_calls} | "
+        f"diff {diff['lines']} lines | tokens {tin}+{tout} | {time.time() - t0:.0f}s")
 
     return {
         "results": [{
             "branch_id": bid, "round": payload["round"], "strategy": payload["strategy"],
-            "passed": passed, "test_output": tail(out, 2000), "workdir": workdir,
+            "passed": passed, "cancelled": cancelled, "stop_reason": stop,
+            "test_output": tail(out, 2000), "workdir": workdir,
             "diff_lines": diff["lines"], "changed": diff["changed"], "patch": diff["patch"],
             "turns": turns, "tool_calls": tool_calls, "input_tokens": tin, "output_tokens": tout,
+            "messages": messages,
         }],
         "usage": [{"stage": "executor", "round": payload["round"], "branch": bid,
                    "input": tin, "output": tout}],
@@ -615,6 +736,31 @@ def commit_to_branch(repo_dir: str, winner: dict, run_id: str, test_cmd: str) ->
     return out
 
 
+def save_trajectories(state: GraphState) -> int:
+    """Save every green branch's full conversation as fine-tuning data (logs/trajectories/)."""
+    out_dir = BASE_DIR / "logs" / "trajectories"
+    w = state.get("winner") or {}
+    n = 0
+    for r in state.get("results", []):
+        if not r.get("passed") or not r.get("messages"):
+            continue
+        out_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "run_id": state["run_id"], "branch_id": r["branch_id"],
+            "winner": r["branch_id"] == w.get("branch_id"),
+            "repo": Path(state["repo_dir"]).name, "task": state["task"],
+            "test_cmd": state["test_cmd"], "strategy": r["strategy"],
+            "model": stage_model("executor"), "thinking": state.get("thinking") or "on",
+            "diff_lines": r["diff_lines"], "turns": r["turns"],
+            "tokens": r["input_tokens"] + r["output_tokens"],
+            "tools": TOOLS, "messages": r["messages"],
+        }
+        path = out_dir / f"{state['run_id']}_{r['branch_id']}.json"
+        path.write_text(json.dumps(record, indent=1, ensure_ascii=False), encoding="utf-8")
+        n += 1
+    return n
+
+
 def finalize_node(state: GraphState) -> dict:
     logs = BASE_DIR / "logs"
     logs.mkdir(exist_ok=True)
@@ -644,6 +790,8 @@ def finalize_node(state: GraphState) -> dict:
                     shutil.copy2(src, dst)
             applied = True
 
+    saved = save_trajectories(state)
+
     summary = {
         "run_id": state["run_id"],
         "status": "already_green" if state.get("baseline_passed") else ("green" if w else "red"),
@@ -652,10 +800,11 @@ def finalize_node(state: GraphState) -> dict:
                                            "turns", "tool_calls")},
         "git": branch,
         "applied": applied,
-        "branches": [{k: r[k] for k in ("branch_id", "passed", "diff_lines", "turns", "tool_calls",
-                                        "input_tokens", "output_tokens")}
+        "branches": [{k: r.get(k) for k in ("branch_id", "passed", "cancelled", "diff_lines", "turns",
+                                            "tool_calls", "input_tokens", "output_tokens")}
                      for r in state.get("results", [])],
         "tokens_by_stage": totals,
+        "trajectories_saved": saved,
     }
     (logs / f"graph_{state['run_id']}.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return {"summary": summary}
@@ -696,7 +845,8 @@ def build_graph():
 
 def run(repo: str, task: str, test_cmd: str = "pytest -q", branches: int = 3, rounds: int = 2,
         max_turns: int = 15, apply: bool = False, work_root: Optional[str] = None,
-        make_branch: bool = True, on_log=None, full: bool = False) -> dict:
+        make_branch: bool = True, on_log=None, full: bool = False,
+        first_green: bool = True, thinking: Optional[str] = None) -> dict:
     """Returns the summary dict, or the full final graph state when full=True."""
     global _log_hook
     repo_dir = str(Path(repo).resolve())
@@ -708,6 +858,8 @@ def run(repo: str, task: str, test_cmd: str = "pytest -q", branches: int = 3, ro
         "run_id": time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:4],
         "n_branches": branches, "max_rounds": rounds, "max_turns": max_turns, "apply": apply,
         "make_branch": make_branch,
+        "first_green": first_green,
+        "thinking": thinking or os.getenv("EXECUTOR_THINKING") or None,
         "results": [], "usage": [], "feedback": "",
     }
     _log_hook = on_log
@@ -728,10 +880,14 @@ def main():
     ap.add_argument("--max-turns", type=int, default=15)
     ap.add_argument("--apply", action="store_true", help="Copy the winning fix back into --repo")
     ap.add_argument("--no-branch", action="store_true", help="Don't commit the fix to a git branch")
+    ap.add_argument("--all-branches", action="store_true",
+                    help="Let every branch finish instead of stopping at the first green one")
+    ap.add_argument("--thinking", choices=["on", "low", "off"], default=None,
+                    help="Executor reasoning mode (Nemotron 3); default: model default")
     a = ap.parse_args()
 
     s = run(a.repo, a.task, a.test_cmd, a.branches, a.rounds, a.max_turns, a.apply,
-            make_branch=not a.no_branch)
+            make_branch=not a.no_branch, first_green=not a.all_branches, thinking=a.thinking)
     print("\n=== SUMMARY ===")
     g = s.get("git") or {}
     if g.get("branch"):

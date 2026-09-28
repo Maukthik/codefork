@@ -97,6 +97,11 @@ with st.sidebar:
     branches = st.slider("Parallel branches", 1, 5, 3)
     rounds = st.slider("Max rounds", 1, 3, 2)
     max_turns = st.slider("Max turns per branch", 3, 20, 10)
+    first_green = st.checkbox("Stop at first green branch", value=True,
+                              help="Faster and cheaper. Untick to let every branch finish and compare diffs.")
+    thinking = st.radio("Executor thinking", ["on", "low", "off"], horizontal=True,
+                        index=["on", "low", "off"].index(os.getenv("EXECUTOR_THINKING", "off")),
+                        help="Nemotron reasoning mode. off/low = faster and fewer tokens, may be less accurate.")
     sandbox = st.radio("Sandbox", ["nebius", "local"], horizontal=True,
                        index=1 if os.getenv("SANDBOX", "nebius") == "local" else 0,
                        help="nebius: Token Factory Sandboxes (default). "
@@ -144,7 +149,8 @@ if st.button("Run agent", type="primary", disabled=running):
     job = {"logs": [], "done": False, "state": None, "error": None, "started": time.time()}
     ss.job, ss.decision = job, None
     kwargs = dict(repo=repo_dir, task=task, test_cmd=test_cmd, branches=branches,
-                  rounds=rounds, max_turns=max_turns)
+                  rounds=rounds, max_turns=max_turns, first_green=first_green,
+                  thinking=None if thinking == "on" else thinking)
     threading.Thread(target=worker, args=(job, kwargs), daemon=True).start()
     running = True
 
@@ -186,6 +192,8 @@ if job and job["done"]:
     m2.metric("Rounds", summary["rounds"])
     m3.metric("Branches tried", len(results))
     m4.metric("Total tokens", f"{tokens:,}")
+    st.caption(f"Finished in {job.get('elapsed', 0):.0f}s. "
+               f"{summary.get('trajectories_saved', 0)} winning run(s) saved to logs/trajectories for fine-tuning.")
 
     st.subheader("Branches")
     for rnd in sorted({r["round"] for r in results}):
@@ -194,7 +202,8 @@ if job and job["done"]:
         for col, r in zip(st.columns(len(row)), row):
             with col.container(border=True):
                 win = w and r["branch_id"] == w["branch_id"]
-                badge = ":green[GREEN]" if r["passed"] else ":red[red]"
+                badge = (":green[GREEN]" if r["passed"] else
+                         ":gray[stopped]" if r.get("cancelled") else ":red[red]")
                 st.markdown(f"**{r['branch_id']}** {badge}{'  🏆 winner' if win else ''}")
                 st.caption(r["strategy"])
                 st.write(f"{r['turns']} turns, {r['tool_calls']} tool calls, {r['diff_lines']} diff lines, "
