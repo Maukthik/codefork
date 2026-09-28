@@ -97,14 +97,16 @@ with st.sidebar:
     branches = st.slider("Parallel branches", 1, 5, 3)
     rounds = st.slider("Max rounds", 1, 3, 2)
     max_turns = st.slider("Max turns per branch", 3, 20, 10)
-    sandbox = st.radio("Sandbox", ["docker", "local"], horizontal=True,
-                       index=1 if os.getenv("SANDBOX", "docker") == "local" else 0,
-                       help="local runs commands on your machine: only for trusted demo repos")
+    sandbox = st.radio("Sandbox", ["nebius", "local"], horizontal=True,
+                       index=1 if os.getenv("SANDBOX", "nebius") == "local" else 0,
+                       help="nebius: Token Factory Sandboxes (default). "
+                            "local: runs on your machine, only for trusted demo repos")
     st.caption(f"Provider: {os.getenv('PROVIDER', 'nebius')} | executor: {ag.stage_model('executor') or '?'}")
     os.environ["SANDBOX"] = sandbox
 
 repo_dir = str(Path(repo).resolve())
 repo_ok = Path(repo_dir).is_dir()
+sandbox_problem = ag.sandbox_ready()
 
 # ---------------------------------------------------------------------------
 # header + step 1: the repo as it is now
@@ -116,6 +118,9 @@ st.write("Give it a repo with failing tests. It tries several fixes in parallel,
 
 if not repo_ok:
     st.error(f"Folder not found: {repo_dir}")
+    st.stop()
+if sandbox_problem:
+    st.error(sandbox_problem)
     st.stop()
 
 with st.expander("Repo as it is now", expanded=not job):

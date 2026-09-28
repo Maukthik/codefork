@@ -7,8 +7,9 @@ Flow:
              -> (winner? -> finalize)
              -> (rounds left? -> reflector -> planner) else finalize
 
-Each executor branch works on its own copy of the repo, so branches never
-overwrite each other. agent.py is untouched and stays the working fallback.
+Code runs in Nebius Token Factory Sandboxes: the repo becomes one sandbox checkpoint
+and every branch forks from it. Each branch keeps its own copy of the files, so
+branches never overwrite each other. SANDBOX=local exists only for tests.
 
 Usage:
     python agent_graph.py --repo workspace/myrepo --task "Make the failing tests pass"
@@ -24,9 +25,11 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import json
 import operator
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -138,17 +141,76 @@ def parse_json(text: str):
 # Sandbox
 # ---------------------------------------------------------------------------
 
-_warned_nebius = False
+_local = threading.local()
+_base_cache: dict[str, object] = {}     # repo content hash -> Nebius checkpoint image
+_base_locks: dict[str, threading.Lock] = {}
+_cache_lock = threading.Lock()
+ORIGIN: dict[str, str] = {}             # branch dir -> repo dir it was copied from
+APP = "/app"                            # where the repo lives inside the sandbox
+SKIP_UPLOAD = {".git", ".venv", "venv", "__pycache__", ".pytest_cache", "node_modules", ".mypy_cache"}
+
+
+def _contree_client():
+    """One Contree (Nebius Sandboxes) client per thread (branches run in parallel threads)."""
+    if not hasattr(_local, "client"):
+        from contree_sdk import ContreeSync
+        _local.client = ContreeSync()
+    return _local.client
+
+
+def _repo_files(root: str) -> dict[str, Path]:
+    root_p = Path(root)
+    return {p.relative_to(root_p).as_posix(): p for p in root_p.rglob("*")
+            if p.is_file() and not SKIP_UPLOAD & set(p.relative_to(root_p).parts)}
+
+
+def _repo_hash(files: dict[str, Path]) -> str:
+    h = hashlib.sha256()
+    for rel in sorted(files):
+        h.update(rel.encode())
+        h.update(files[rel].read_bytes())
+    return h.hexdigest()
+
+
+def _base_checkpoint(repo_dir: str):
+    """Nebius checkpoint = base image + pytest + the repo (+ its requirements.txt).
+    Built once per repo state; every branch forks from it (native sandbox branching)."""
+    files = _repo_files(repo_dir)
+    key = _repo_hash(files)
+    with _cache_lock:
+        if key in _base_cache:
+            return _base_cache[key]
+        lock = _base_locks.setdefault(key, threading.Lock())
+    with lock:  # branches asking at the same time wait for one build
+        if key in _base_cache:
+            return _base_cache[key]
+        img = _contree_client().images.use(os.getenv("SANDBOX_IMAGE", "python:3.12-slim"))
+        img = img.run(shell="pip install -q pytest", disposable=False).wait()
+        img = img.apply_files({f"{APP[1:]}/{rel}": str(p) for rel, p in files.items()})
+        if "requirements.txt" in files:
+            img = img.run(shell=f"cd {APP} && pip install -q -r requirements.txt",
+                          disposable=False).wait()
+        log(f"[sandbox] Nebius checkpoint ready for {Path(repo_dir).name} ({img.uuid})")
+        with _cache_lock:
+            _base_cache[key] = img
+        return img
+
+
+def _changed_files(origin: str, workdir: str) -> dict[str, str]:
+    """Files in the branch dir that differ from (or are new vs) the original repo."""
+    if Path(origin).resolve() == Path(workdir).resolve():
+        return {}
+    a, b = _repo_files(origin), _repo_files(workdir)
+    return {f"{APP[1:]}/{rel}": str(p) for rel, p in b.items()
+            if rel not in a or a[rel].read_bytes() != p.read_bytes()}
 
 
 def run_in_sandbox(workdir: str, command: str, timeout: int = 120) -> tuple[int, str]:
-    """Run a command against a branch directory.
-    SANDBOX=docker (default) uses the fork-sandbox image: no network, 512m, 1 CPU.
-    SANDBOX=local runs on the host (tests / quick debugging only)."""
-    global _warned_nebius
-    mode = os.getenv("SANDBOX", "docker").lower()
-
-    if mode == "local":
+    """Run a command against a repo or branch directory.
+    SANDBOX=nebius (default): Nebius Token Factory Sandboxes. The branch's edited files are
+        overlaid on the shared repo checkpoint; each run is disposable.
+    SANDBOX=local: runs on this machine. Only for tests and trusted demo repos."""
+    if os.getenv("SANDBOX", "nebius").lower() == "local":
         try:
             p = subprocess.run(command, shell=True, cwd=workdir, capture_output=True,
                                text=True, encoding="utf-8", errors="replace", timeout=timeout)
@@ -156,24 +218,30 @@ def run_in_sandbox(workdir: str, command: str, timeout: int = 120) -> tuple[int,
         except subprocess.TimeoutExpired:
             return 124, f"Command timed out after {timeout}s"
 
-    if mode == "nebius" and not _warned_nebius:
-        log("[agent_graph] SANDBOX=nebius not wired into the graph yet, using docker.")
-        _warned_nebius = True
+    workdir = str(Path(workdir).resolve())
+    origin = ORIGIN.get(workdir, workdir)
+    base = _base_checkpoint(origin)
+    shell = f"cd {APP} && timeout {timeout} sh -c {shlex.quote(command)}"
+    r = base.run(shell=shell, files=_changed_files(origin, workdir) or None,
+                 timeout=timeout + 60).wait()
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.exit_code == 124:
+        out += f"\nCommand timed out after {timeout}s"
+    return r.exit_code, out
 
-    name = f"fork-{uuid.uuid4().hex[:10]}"
-    docker_cmd = [
-        "docker", "run", "--rm", "--name", name,
-        "--network", "none", "--memory", "512m", "--cpus", "1",
-        "-v", f"{Path(workdir).resolve()}:/workspace", "-w", "/workspace",
-        os.getenv("SANDBOX_IMAGE", "fork-sandbox"), "sh", "-c", command,
-    ]
+
+def sandbox_ready() -> Optional[str]:
+    """Returns an error message if the configured sandbox can't be used, else None."""
+    if os.getenv("SANDBOX", "nebius").lower() == "local":
+        return None
+    missing = [k for k in ("NEBIUS_API_KEY", "NEBIUS_PROJECT_ID") if not os.getenv(k)]
+    if missing:
+        return f"Missing {', '.join(missing)} in .env (needed for Nebius Sandboxes)."
     try:
-        p = subprocess.run(docker_cmd, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout)
-        return p.returncode, (p.stdout or "") + (p.stderr or "")
-    except subprocess.TimeoutExpired:
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-        return 124, f"Command timed out after {timeout}s"
+        import contree_sdk  # noqa: F401
+    except ImportError:
+        return "contree-sdk isn't installed. Run: pip install contree-sdk"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +265,7 @@ def copy_repo(src: str, dst: str) -> None:
     if Path(dst).exists():
         shutil.rmtree(dst)
     shutil.copytree(src, dst, ignore=shutil.ignore_patterns(*IGNORE_DIRS))
+    ORIGIN[str(Path(dst).resolve())] = str(Path(src).resolve())
 
 
 def collect_files(root: str) -> dict[str, str]:
@@ -308,16 +377,10 @@ class GraphState(TypedDict, total=False):
 # Nodes
 # ---------------------------------------------------------------------------
 
-def docker_ok() -> bool:
-    try:
-        return subprocess.run(["docker", "info"], capture_output=True, timeout=20).returncode == 0
-    except Exception:
-        return False
-
-
 def baseline_node(state: GraphState) -> dict:
-    if os.getenv("SANDBOX", "docker").lower() != "local" and not docker_ok():
-        raise RuntimeError("Docker isn't running. Start Docker Desktop and retry.")
+    problem = sandbox_ready()
+    if problem:
+        raise RuntimeError(problem)
     code, out = run_in_sandbox(state["repo_dir"], state["test_cmd"])
     if code == 5:
         raise RuntimeError("pytest collected no tests. Check the repo path and test file names.")
@@ -376,7 +439,8 @@ def fan_out(state: GraphState) -> list[Send]:
 
 
 EXECUTOR_PROMPT = """You are the executor of an autonomous coding agent. You work inside a copy of a Python repo.
-Tools: list_files, read_file, write_file, run_command. The sandbox has NO internet: do not pip install.
+Tools: list_files, read_file, write_file, run_command. Commands run in a fresh sandbox each time:
+file changes made by shell commands (sed, echo >, pip install) are NOT kept. Make every edit with write_file.
 Goal: make the test command pass by fixing the source code. Do NOT edit or delete tests.
 Follow the strategy you are given. Keep changes minimal. Run the tests to check your fix.
 When the tests pass (or you cannot make progress), reply with a short summary and no tool calls."""
@@ -425,7 +489,10 @@ def executor_node(payload: dict) -> dict:
             log(f"[{bid}] turn {turns}: {c.function.name} {shown} -> {first[:80]}")
             messages.append({"role": "tool", "tool_call_id": c.id, "content": result})
 
-    code, out = run_in_sandbox(workdir, payload["test_cmd"])  # final check is the judge
+    try:
+        code, out = run_in_sandbox(workdir, payload["test_cmd"])  # final check is the judge
+    except Exception as e:
+        code, out = 1, f"Sandbox error: {type(e).__name__}: {e}"
     diff = make_diff(payload["repo_dir"], workdir)
     passed = code == 0
     log(f"[{bid}] {'GREEN' if passed else 'red'} | turns {turns} | tools {tool_calls} | "

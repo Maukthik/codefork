@@ -186,3 +186,92 @@ def test_no_branch_flag(repo, tmp_path, monkeypatch):
     s = ag.run(str(repo), "fix add", branches=1, rounds=1, make_branch=False,
                work_root=str(tmp_path / "branches"))
     assert s["git"] is None and "fork/fix" not in sh(repo, "branch")
+
+
+# --- Nebius sandbox path (fake Contree client, no network) ----------------------
+
+import itertools
+import shlex
+import tempfile
+from pathlib import Path
+
+
+class FakeImage:
+    """Mimics ContreeSync images: run(...).wait() returns a new image with the result."""
+    counter = itertools.count()
+
+    def __init__(self, files, log, exit_code=0, stdout="", stderr=""):
+        self.files, self.log = files, log
+        self.exit_code, self.stdout, self.stderr = exit_code, stdout, stderr
+        self.uuid = f"img-{next(self.counter)}"
+
+    def apply_files(self, mapping):
+        self.log.append(("apply_files", sorted(mapping)))
+        new = dict(self.files)
+        new.update({k: Path(v).read_bytes() for k, v in mapping.items()})
+        return FakeImage(new, self.log)
+
+    def run(self, shell, files=None, disposable=True, timeout=None):
+        self.log.append(("run", shell, sorted(files or {})))
+        return SimpleNamespace(wait=lambda: self._exec(shell, files or {}))
+
+    def _exec(self, shell, overlay):
+        if "pip install" in shell:
+            return FakeImage(self.files, self.log)
+        inner = shlex.split(shell)[-1]          # cd /app && timeout N sh -c '<inner>'
+        root = Path(tempfile.mkdtemp())
+        allfiles = dict(self.files)
+        allfiles.update({k: Path(v).read_bytes() for k, v in overlay.items()})
+        for key, data in allfiles.items():
+            p = root / key
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+        p = subprocess.run(inner, shell=True, cwd=root / "app", capture_output=True, text=True)
+        return FakeImage(self.files, self.log, p.returncode, p.stdout, p.stderr)
+
+
+@pytest.fixture
+def fake_nebius(monkeypatch, tmp_path):
+    monkeypatch.setenv("SANDBOX", "nebius")
+    monkeypatch.setenv("NEBIUS_API_KEY", "test")
+    monkeypatch.setenv("NEBIUS_PROJECT_ID", "test")
+    monkeypatch.setattr(ag, "BASE_DIR", tmp_path)
+    ag._base_cache.clear()
+    calls = []
+    client = SimpleNamespace(images=SimpleNamespace(use=lambda name: FakeImage({}, calls)))
+    monkeypatch.setattr(ag, "_contree_client", lambda: client)
+    return calls
+
+
+def test_nebius_runs_tests_in_sandbox(fake_nebius, tmp_path):
+    r = tmp_path / "repo"; r.mkdir()
+    (r / "calc.py").write_text(BUGGY); (r / "test_calc.py").write_text(TEST)
+    code, out = ag.run_in_sandbox(str(r), "python -m pytest -q")
+    assert code == 1 and "1 failed" in out
+
+
+def test_nebius_branches_share_one_checkpoint_and_overlay_edits(fake_nebius, tmp_path, monkeypatch):
+    r = tmp_path / "repo"; r.mkdir()
+    (r / "calc.py").write_text(BUGGY); (r / "test_calc.py").write_text(TEST)
+    monkeypatch.setattr(ag, "chat", make_fake_chat([["bad idea", "GOOD fix", "bad 2"]]))
+    s = ag.run(str(r), "fix add", branches=3, rounds=1, work_root=str(tmp_path / "branches"))
+    assert s["status"] == "green" and s["winner"]["branch_id"] == "r1_b1"
+    applies = [c for c in fake_nebius if c[0] == "apply_files"]
+    assert len(applies) == 1                                   # repo uploaded once, shared by all branches
+    branch_runs = [c for c in fake_nebius if c[0] == "run" and c[2]]
+    assert branch_runs and all(c[2] == ["app/calc.py"] for c in branch_runs)  # only edited file overlaid
+
+
+def test_sandbox_ready_reports_missing_keys(monkeypatch):
+    monkeypatch.setenv("SANDBOX", "nebius")
+    monkeypatch.delenv("NEBIUS_API_KEY", raising=False)
+    assert "NEBIUS_API_KEY" in ag.sandbox_ready()
+    monkeypatch.setenv("SANDBOX", "local")
+    assert ag.sandbox_ready() is None
+
+
+def test_llm_client_not_shadowed(monkeypatch):
+    """Regression: the sandbox helper must not overwrite the LLM client global."""
+    monkeypatch.setattr(ag, "_client", None)
+    monkeypatch.setenv("PROVIDER", "ollama")
+    assert hasattr(ag.get_client(), "chat")
