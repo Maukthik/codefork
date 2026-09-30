@@ -25,10 +25,12 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import fnmatch
 import hashlib
 import json
 import operator
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -138,7 +140,9 @@ def chat(model: str, messages: list, tools: Optional[list] = None,
     try:
         resp = get_client().chat.completions.create(**kwargs)
     except Exception as e:
-        if "extra_body" not in kwargs:
+        # Only a "bad request" means the provider doesn't understand the switch.
+        # Rate limits, timeouts and server errors must not turn thinking control off.
+        if "extra_body" not in kwargs or getattr(e, "status_code", None) not in (400, 422):
             raise
         log(f"[llm] provider rejected the thinking switch ({type(e).__name__}); using model default")
         _thinking_unsupported = True
@@ -150,6 +154,54 @@ def chat(model: str, messages: list, tools: Optional[list] = None,
     m = choice.message
     return SimpleNamespace(content=m.content, tool_calls=m.tool_calls,
                            finish_reason=choice.finish_reason), usage
+
+
+# ---------------------------------------------------------------------------
+# Cost tracking (USD). Prices are per 1M tokens (input, output) on Nebius Token Factory.
+# Matched by substring of the model id; override with PRICES_JSON='{"nano": [0.06, 0.24]}'.
+# ---------------------------------------------------------------------------
+
+DEFAULT_PRICES = {"nano": (0.06, 0.24), "super": (0.30, 0.90), "ultra": (1.00, 3.00)}
+
+
+def prices() -> dict:
+    table = dict(DEFAULT_PRICES)
+    if os.getenv("PRICES_JSON"):
+        table.update({k.lower(): tuple(v) for k, v in json.loads(os.environ["PRICES_JSON"]).items()})
+    return table
+
+
+def cost_usd(model: str, tokens_in: int, tokens_out: int) -> float:
+    """Dollar cost of one call. Unknown models cost 0 (e.g. local Ollama)."""
+    m = (model or "").lower()
+    for key, (p_in, p_out) in prices().items():
+        if key in m:
+            return (tokens_in * p_in + tokens_out * p_out) / 1_000_000
+    return 0.0
+
+
+class Budget:
+    """Running spend for one agent run, shared by all parallel branches."""
+
+    def __init__(self, max_usd: Optional[float] = None):
+        self.max_usd, self.spent, self._lock = max_usd, 0.0, threading.Lock()
+
+    def add(self, model: str, tokens_in: int, tokens_out: int) -> float:
+        c = cost_usd(model, tokens_in, tokens_out)
+        with self._lock:
+            self.spent += c
+        return c
+
+    def exceeded(self) -> bool:
+        return self.max_usd is not None and self.spent >= self.max_usd
+
+
+_budgets: dict[str, Budget] = {}
+
+
+def budget(run_id: str) -> Budget:
+    with _client_lock:
+        return _budgets.setdefault(run_id, Budget())
 
 
 def parse_json(text: str):
@@ -232,6 +284,13 @@ def _changed_files(origin: str, workdir: str) -> dict[str, str]:
             if rel not in a or a[rel].read_bytes() != p.read_bytes()}
 
 
+def _deleted_files(origin: str, workdir: str) -> list[str]:
+    """Files in the original repo that the branch deleted (the checkpoint still has them)."""
+    if Path(origin).resolve() == Path(workdir).resolve():
+        return []
+    return sorted(set(_repo_files(origin)) - set(_repo_files(workdir)))
+
+
 def run_in_sandbox(workdir: str, command: str, timeout: int = 120) -> tuple[int, str]:
     """Run a command against a repo or branch directory.
     SANDBOX=nebius (default): Nebius Token Factory Sandboxes. The branch's edited files are
@@ -248,7 +307,9 @@ def run_in_sandbox(workdir: str, command: str, timeout: int = 120) -> tuple[int,
     workdir = str(Path(workdir).resolve())
     origin = ORIGIN.get(workdir, workdir)
     base = _base_checkpoint(origin)
-    shell = f"cd {APP} && timeout {timeout} sh -c {shlex.quote(command)}"
+    deleted = _deleted_files(origin, workdir)
+    rm = f"rm -f -- {' '.join(shlex.quote(d) for d in deleted)} && " if deleted else ""
+    shell = f"cd {APP} && {rm}timeout {timeout} sh -c {shlex.quote(command)}"
     r = base.run(shell=shell, files=_changed_files(origin, workdir) or None,
                  timeout=timeout + 60).wait()
     out = (r.stdout or "") + (r.stderr or "")
@@ -305,7 +366,8 @@ def collect_files(root: str) -> dict[str, str]:
             if p.stat().st_size > MAX_FILE_BYTES:
                 continue
             try:
-                out[p.relative_to(root_p).as_posix()] = p.read_text(encoding="utf-8")
+                # bytes -> str keeps CRLF as-is, so patches still apply to Windows-style files
+                out[p.relative_to(root_p).as_posix()] = p.read_bytes().decode("utf-8")
             except (UnicodeDecodeError, OSError):
                 continue  # skip binary files
     return out
@@ -321,13 +383,87 @@ def make_diff(orig_dir: str, new_dir: str) -> dict:
         changed.append(rel)
         d = list(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
                                       fromfile=f"a/{rel}", tofile=f"b/{rel}"))
-        patch.extend(d)
+        # A last line without "\n" would glue onto the next file's header and break
+        # `git apply`. Mark it the way git does.
+        patch.extend(l if l.endswith("\n") else l + "\n\\ No newline at end of file\n" for l in d)
         lines += sum(1 for l in d if l[:1] in "+-" and not l.startswith(("+++", "---")))
     return {"patch": "".join(patch), "changed": changed, "lines": lines}
 
 
 def list_files(root: str) -> list[str]:
     return sorted(collect_files(root).keys())
+
+
+# ---------------------------------------------------------------------------
+# Tamper guard: the tests are the judge, so the agent may not touch them
+# ---------------------------------------------------------------------------
+
+PROTECTED_NAMES = ("test_*.py", "*_test.py", "conftest.py", "pytest.ini", "tox.ini",
+                   "setup.cfg", "pyproject.toml", ".coveragerc")
+PROTECTED_DIRS = {"tests", "test", "testing"}
+
+
+def is_protected(rel: str) -> bool:
+    """Test files and test-runner config. Editing these could make tests pass without a fix."""
+    parts = Path(rel).parts
+    return (any(fnmatch.fnmatch(parts[-1], pat) for pat in PROTECTED_NAMES)
+            or any(p in PROTECTED_DIRS for p in parts[:-1]))
+
+
+def restore_protected(origin: str, workdir: str) -> list[str]:
+    """Put every protected file in workdir back to its original state.
+    Undoes edits, re-creates deletions and removes new protected files (e.g. a
+    conftest.py that skips everything). Returns the files that had been tampered with."""
+    if Path(origin).resolve() == Path(workdir).resolve():
+        return []
+    a, b = _repo_files(origin), _repo_files(workdir)
+    tampered = []
+    for rel in sorted(set(a) | set(b)):
+        if not is_protected(rel):
+            continue
+        src, dst = a.get(rel), Path(workdir) / rel
+        if src is None:                                   # agent added it
+            dst.unlink()
+        elif rel not in b:                                # agent deleted it
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        elif src.read_bytes() != b[rel].read_bytes():     # agent edited it
+            shutil.copy2(src, dst)
+        else:
+            continue
+        tampered.append(rel)
+    return tampered
+
+
+_COUNT_RE = re.compile(r"(\d+) (passed|failed|errors?|skipped|xfailed|xpassed|deselected)")
+
+
+def pytest_counts(output: str) -> dict:
+    """Counts from pytest's summary line, e.g. '1 failed, 3 passed in 0.1s'. {} if not pytest."""
+    lines = [l for l in output.splitlines() if _COUNT_RE.search(l)]
+    if not lines:
+        return {}
+    counts: dict[str, int] = {}
+    for n, kind in _COUNT_RE.findall(lines[-1]):
+        kind = "error" if kind.startswith("error") else kind
+        counts[kind] = counts.get(kind, 0) + int(n)
+    return counts
+
+
+def judge(workdir: str, test_cmd: str, baseline_total: int = 0) -> tuple[int, str, list[str]]:
+    """The only place a branch is declared green. Restores the original tests first,
+    runs the real test command, and (for pytest) checks that at least as many tests
+    pass as existed at baseline, so skipping or deselecting tests doesn't count.
+    Returns (exit code, output, tampered files)."""
+    tampered = restore_protected(ORIGIN.get(str(Path(workdir).resolve()), workdir), workdir)
+    code, out = run_in_sandbox(workdir, test_cmd)
+    if code == 0 and baseline_total:
+        passed = pytest_counts(out).get("passed", 0)
+        if passed < baseline_total:
+            code = 1
+            out += (f"\n[judge] only {passed} tests passed but the suite has {baseline_total}; "
+                    "skipped or deselected tests don't count.")
+    return code, out, tampered
 
 
 def repo_context(root: str, failing_output: str = "", budget: int = 30000) -> str:
@@ -339,7 +475,7 @@ def repo_context(root: str, failing_output: str = "", budget: int = 30000) -> st
         return (0 if mentioned else 1, 0 if rel.endswith(".py") else 1, len(files[rel]))
     parts, used, skipped = [], 0, []
     for rel in sorted(files, key=rank):
-        block = f"### {rel}\n```\n{files[rel]}\n```\n"
+        block = f"### {rel}\n```\n{files[rel].replace(chr(13) + chr(10), chr(10))}\n```\n"
         if used + len(block) > budget:
             skipped.append(rel)
             continue
@@ -374,7 +510,17 @@ TOOLS = [
 ]
 
 
-def run_tool(workdir: str, name: str, args: dict) -> str:
+def write_preserving_newlines(p: Path, content: str) -> None:
+    """Write exactly what the model sent, keeping the file's existing line endings.
+    Path.write_text would turn every \n into \r\n on Windows, which makes an LF repo
+    show every line as changed (huge diffs, wrong 'smallest diff' winner)."""
+    content = content.replace("\r\n", "\n")
+    if p.exists() and b"\r\n" in p.read_bytes():
+        content = content.replace("\n", "\r\n")
+    p.write_bytes(content.encode("utf-8"))
+
+
+def run_tool(workdir: str, name: str, args: dict, protect: bool = True) -> str:
     try:
         if name == "list_files":
             return "\n".join(list_files(workdir)) or "(empty)"
@@ -382,8 +528,11 @@ def run_tool(workdir: str, name: str, args: dict) -> str:
             return tail(safe_path(workdir, args["path"]).read_text(encoding="utf-8"), 20000)
         if name == "write_file":
             p = safe_path(workdir, args["path"])
+            if protect and is_protected(p.relative_to(Path(workdir).resolve()).as_posix()):
+                return (f"Refused: {args['path']} is a test or test-config file and is read-only. "
+                        "Fix the source code so the existing tests pass.")
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(args["content"], encoding="utf-8")
+            write_preserving_newlines(p, args["content"])
             return f"Wrote {args['path']} ({len(args['content'])} chars)"
         if name == "run_command":
             code, out = run_in_sandbox(workdir, args["command"])
@@ -410,9 +559,11 @@ class GraphState(TypedDict, total=False):
     make_branch: bool
     first_green: bool
     thinking: Optional[str]
+    max_usd: Optional[float]
 
     baseline_passed: bool
     baseline_output: str
+    baseline_total: int        # tests in the suite at baseline (pytest only, else 0)
     round: int
     strategies: list[str]
     feedback: str
@@ -433,8 +584,12 @@ def baseline_node(state: GraphState) -> dict:
     code, out = run_in_sandbox(state["repo_dir"], state["test_cmd"])
     if code == 5:
         raise RuntimeError("pytest collected no tests. Check the repo path and test file names.")
-    log(f"[baseline] tests {'GREEN' if code == 0 else 'RED'} (exit {code})")
-    return {"baseline_passed": code == 0, "baseline_output": tail(out), "round": 0}
+    counts = pytest_counts(out)
+    total = sum(counts.get(k, 0) for k in ("passed", "failed", "error"))
+    log(f"[baseline] tests {'GREEN' if code == 0 else 'RED'} (exit {code})"
+        + (f" | {counts}" if counts else ""))
+    return {"baseline_passed": code == 0, "baseline_output": tail(out),
+            "baseline_total": total, "round": 0}
 
 
 PLANNER_PROMPT = """You are the planner for an autonomous coding agent that fixes failing Python test suites.
@@ -455,9 +610,11 @@ def planner_node(state: GraphState) -> dict:
     if state.get("feedback"):
         user += f"\n\nFeedback from the previous round (these attempts failed):\n{state['feedback']}"
 
-    msg, (i, o) = chat(stage_model("planner"),
+    model = stage_model("planner")
+    msg, (i, o) = chat(model,
                        [{"role": "system", "content": PLANNER_PROMPT.format(n=n)},
                         {"role": "user", "content": user}])
+    usd = budget(state["run_id"]).add(model, i, o)
     data = parse_json(msg.content) or {}
     strategies = [s for s in data.get("strategies", []) if isinstance(s, str) and s.strip()][:n]
     while len(strategies) < n:  # fallback if the model returns fewer / bad JSON
@@ -467,7 +624,8 @@ def planner_node(state: GraphState) -> dict:
     for k, s in enumerate(strategies):
         log(f"   b{k}: {s[:100]}")
     return {"strategies": strategies, "round": rnd,
-            "usage": [{"stage": "planner", "round": rnd, "input": i, "output": o}]}
+            "usage": [{"stage": "planner", "round": rnd, "model": model,
+                       "input": i, "output": o, "usd": usd}]}
 
 
 def fan_out(state: GraphState) -> list[Send]:
@@ -481,6 +639,7 @@ def fan_out(state: GraphState) -> list[Send]:
             "repo_dir": state["repo_dir"],
             "test_cmd": state["test_cmd"],
             "baseline_output": state["baseline_output"],
+            "baseline_total": state.get("baseline_total", 0),
             "work_root": state["work_root"],
             "run_id": state["run_id"],
             "max_turns": state["max_turns"],
@@ -493,10 +652,12 @@ def fan_out(state: GraphState) -> list[Send]:
 
 EXECUTOR_PROMPT = """You are the executor of an autonomous coding agent. You work inside a copy of a Python repo.
 Tools: list_files, read_file, write_file, run_command. The repo's key files are included below.
-Goal: make the test command pass by fixing the source code. Do NOT edit or delete tests.
-Follow the strategy you are given. Keep changes minimal.
+Goal: make the test command pass by fixing the source code. Keep changes minimal.
+Follow the strategy you are given.
 
 RULES:
+- Test files and test config (test_*.py, conftest.py, pytest.ini, pyproject.toml, tests/) are
+  read-only. Writes to them are refused, and they are restored before the final check.
 - Make EVERY edit with write_file, passing the complete new file content.
 - NEVER edit files with shell commands (sed, echo >, cat <<EOF, python -c, pip install).
   Each command runs in a fresh sandbox, so those changes are thrown away.
@@ -518,8 +679,10 @@ def executor_node(payload: dict) -> dict:
     workdir = str(Path(payload["work_root"]) / payload["run_id"] / bid)
     copy_repo(payload["repo_dir"], workdir)
     test_cmd = payload["test_cmd"].strip()
+    baseline_total = payload.get("baseline_total", 0)
     first_green = payload.get("first_green", True)
     cancel = _cancel_event(f"{payload['run_id']}:{payload['round']}")
+    spend = budget(payload["run_id"])
 
     messages = [
         {"role": "system", "content": EXECUTOR_PROMPT},
@@ -529,15 +692,20 @@ def executor_node(payload: dict) -> dict:
             f"Repo files:\n{repo_context(payload['repo_dir'], payload['baseline_output'])}\n\n"
             f"Failing output:\n{payload['baseline_output']}")},
     ]
-    model = stage_model("executor")
-    tin = tout = turns = tool_calls = 0
-    verified = None          # (code, output) once the tests have passed
+    model = payload.get("model") or stage_model("executor")
+    tin = tout = turns = tool_calls = refused = 0
+    usd = 0.0
+    tampered: set[str] = set()
+    verified = None          # (code, output) once the judge has seen the tests pass
     stop = "gave up"
     t0 = time.time()
 
     for turns in range(1, payload["max_turns"] + 1):
         if first_green and cancel.is_set():
             stop = "cancelled"
+            break
+        if spend.exceeded():
+            stop = "budget"
             break
         try:
             msg, (i, o) = chat(model, messages, TOOLS, max_tokens=EXECUTOR_MAX_TOKENS,
@@ -546,6 +714,7 @@ def executor_node(payload: dict) -> dict:
             log(f"[{bid}] LLM error: {e}")
             break
         tin, tout = tin + i, tout + o
+        usd += spend.add(model, i, o)
         calls = getattr(msg, "tool_calls", None) or []
 
         if getattr(msg, "finish_reason", None) == "length":
@@ -576,15 +745,17 @@ def executor_node(payload: dict) -> dict:
             first = result.splitlines()[0] if result else ""
             log(f"[{bid}] turn {turns}: {c.function.name} {shown} -> {first[:80]}")
             messages.append({"role": "tool", "tool_call_id": c.id, "content": result})
+            if result.startswith("Refused:"):
+                refused += 1
             if c.function.name == "write_file" and result.startswith("Wrote"):
                 wrote = True
-            if (c.function.name == "run_command" and test_cmd in args.get("command", "")
-                    and result.startswith("exit code 0")):
-                verified = (0, result)
+            # The model's own test runs are information only: they never mark a branch green
+            # (e.g. "pytest -q || true" exits 0). Only judge() can do that.
 
-        if wrote and not verified:  # auto-run tests after edits: saves a turn per check
+        if wrote:  # auto-run the judge after edits: saves a turn per check
             try:
-                code, out = run_in_sandbox(workdir, test_cmd)
+                code, out, t = judge(workdir, test_cmd, baseline_total)
+                tampered.update(t)
             except Exception as e:
                 code, out = 1, f"Sandbox error: {type(e).__name__}: {e}"
             if code == 0:
@@ -606,28 +777,33 @@ def executor_node(payload: dict) -> dict:
         code, out = 1, "Stopped: another branch turned the tests green first."
     else:
         try:
-            code, out = run_in_sandbox(workdir, test_cmd)  # final check is the judge
+            code, out, t = judge(workdir, test_cmd, baseline_total)  # final check is the judge
+            tampered.update(t)
         except Exception as e:
             code, out = 1, f"Sandbox error: {type(e).__name__}: {e}"
     passed = code == 0
     if passed and first_green:
         cancel.set()
+    tampered.update(restore_protected(payload["repo_dir"], workdir))  # keep the patch clean
     diff = make_diff(payload["repo_dir"], workdir)
     status = "GREEN" if passed else ("stopped" if cancelled else "red")
-    log(f"[{bid}] {status} ({stop}) | turns {turns} | tools {tool_calls} | "
-        f"diff {diff['lines']} lines | tokens {tin}+{tout} | {time.time() - t0:.0f}s")
+    guard = f" | blocked {refused} test edits" if refused else ""
+    guard += f" | reverted {sorted(tampered)}" if tampered else ""
+    log(f"[{bid}] {status} ({stop}) | {(model or '?').split('/')[-1]} | turns {turns} | tools {tool_calls} | "
+        f"diff {diff['lines']} lines | tokens {tin}+{tout} | ${usd:.4f} | {time.time() - t0:.0f}s{guard}")
 
     return {
         "results": [{
             "branch_id": bid, "round": payload["round"], "strategy": payload["strategy"],
-            "passed": passed, "cancelled": cancelled, "stop_reason": stop,
+            "model": model, "passed": passed, "cancelled": cancelled, "stop_reason": stop,
             "test_output": tail(out, 2000), "workdir": workdir,
             "diff_lines": diff["lines"], "changed": diff["changed"], "patch": diff["patch"],
             "turns": turns, "tool_calls": tool_calls, "input_tokens": tin, "output_tokens": tout,
+            "usd": usd, "refused_writes": refused, "tampered": sorted(tampered),
             "messages": messages,
         }],
-        "usage": [{"stage": "executor", "round": payload["round"], "branch": bid,
-                   "input": tin, "output": tout}],
+        "usage": [{"stage": "executor", "round": payload["round"], "branch": bid, "model": model,
+                   "input": tin, "output": tout, "usd": usd}],
     }
 
 
@@ -655,12 +831,15 @@ def reflector_node(state: GraphState) -> dict:
     text = "\n\n".join(
         f"## {r['branch_id']}\nStrategy: {r['strategy']}\nChanged: {r['changed']}\n"
         f"Final test output:\n{tail(r['test_output'], 1500)}" for r in attempts)
-    msg, (i, o) = chat(stage_model("reflector"),
+    model = stage_model("reflector")
+    msg, (i, o) = chat(model,
                        [{"role": "system", "content": REFLECTOR_PROMPT},
                         {"role": "user", "content": f"Task: {state['task']}\n\n{text}"}])
+    usd = budget(state["run_id"]).add(model, i, o)
     log(f"[reflector] {(msg.content or '').strip()[:200]}")
     return {"feedback": msg.content or "",
-            "usage": [{"stage": "reflector", "round": state["round"], "input": i, "output": o}]}
+            "usage": [{"stage": "reflector", "round": state["round"], "model": model,
+                       "input": i, "output": o, "usd": usd}]}
 
 
 # ---------------------------------------------------------------------------
@@ -736,29 +915,36 @@ def commit_to_branch(repo_dir: str, winner: dict, run_id: str, test_cmd: str) ->
     return out
 
 
-def save_trajectories(state: GraphState) -> int:
-    """Save every green branch's full conversation as fine-tuning data (logs/trajectories/)."""
+def save_trajectories(state: GraphState) -> tuple[int, int]:
+    """Save branch conversations as fine-tuning data.
+    Green branches -> logs/trajectories/, red ones -> logs/trajectories/failed/.
+    Same task, green vs red, gives preference pairs later. Returns (green, red) counts."""
     out_dir = BASE_DIR / "logs" / "trajectories"
     w = state.get("winner") or {}
-    n = 0
+    green = red = 0
     for r in state.get("results", []):
-        if not r.get("passed") or not r.get("messages"):
+        if r.get("cancelled") or not r.get("messages"):
             continue
-        out_dir.mkdir(parents=True, exist_ok=True)
+        d = out_dir if r.get("passed") else out_dir / "failed"
+        d.mkdir(parents=True, exist_ok=True)
         record = {
-            "run_id": state["run_id"], "branch_id": r["branch_id"],
+            "run_id": state["run_id"], "branch_id": r["branch_id"], "passed": bool(r.get("passed")),
             "winner": r["branch_id"] == w.get("branch_id"),
             "repo": Path(state["repo_dir"]).name, "task": state["task"],
             "test_cmd": state["test_cmd"], "strategy": r["strategy"],
-            "model": stage_model("executor"), "thinking": state.get("thinking") or "on",
+            "model": r.get("model") or stage_model("executor"),
+            "thinking": state.get("thinking") or "on",
             "diff_lines": r["diff_lines"], "turns": r["turns"],
             "tokens": r["input_tokens"] + r["output_tokens"],
             "tools": TOOLS, "messages": r["messages"],
         }
-        path = out_dir / f"{state['run_id']}_{r['branch_id']}.json"
+        path = d / f"{state['run_id']}_{r['branch_id']}.json"
         path.write_text(json.dumps(record, indent=1, ensure_ascii=False), encoding="utf-8")
-        n += 1
-    return n
+        if r.get("passed"):
+            green += 1
+        else:
+            red += 1
+    return green, red
 
 
 def finalize_node(state: GraphState) -> dict:
@@ -768,9 +954,12 @@ def finalize_node(state: GraphState) -> dict:
 
     totals: dict[str, dict] = {}
     for u in state.get("usage", []):
-        t = totals.setdefault(u["stage"], {"input": 0, "output": 0})
+        t = totals.setdefault(u["stage"], {"input": 0, "output": 0, "usd": 0.0})
         t["input"] += u["input"]
         t["output"] += u["output"]
+        t["usd"] += u.get("usd", 0.0)
+    for t in totals.values():
+        t["usd"] = round(t["usd"], 5)
 
     applied = False
     branch = None
@@ -780,7 +969,9 @@ def finalize_node(state: GraphState) -> dict:
                 branch = commit_to_branch(state["repo_dir"], w, state["run_id"], state["test_cmd"])
             except Exception as e:
                 branch = {"error": str(e)}
-        (logs / f"graph_{state['run_id']}_winner.patch").write_text(w["patch"], encoding="utf-8")
+        # bytes, not write_text: on Windows write_text turns every \n into \r\n and the
+        # patch no longer applies to LF files
+        (logs / f"graph_{state['run_id']}_winner.patch").write_bytes(w["patch"].encode("utf-8"))
         if state.get("apply"):
             for rel in w["changed"]:
                 src = Path(w["workdir"]) / rel
@@ -790,7 +981,8 @@ def finalize_node(state: GraphState) -> dict:
                     shutil.copy2(src, dst)
             applied = True
 
-    saved = save_trajectories(state)
+    saved, saved_red = save_trajectories(state)
+    _budgets.pop(state["run_id"], None)
 
     summary = {
         "run_id": state["run_id"],
@@ -800,11 +992,16 @@ def finalize_node(state: GraphState) -> dict:
                                            "turns", "tool_calls")},
         "git": branch,
         "applied": applied,
-        "branches": [{k: r.get(k) for k in ("branch_id", "passed", "cancelled", "diff_lines", "turns",
-                                            "tool_calls", "input_tokens", "output_tokens")}
+        "branches": [{k: r.get(k) for k in ("branch_id", "model", "passed", "cancelled", "stop_reason",
+                                            "diff_lines", "turns", "tool_calls", "input_tokens",
+                                            "output_tokens", "usd", "refused_writes", "tampered")}
                      for r in state.get("results", [])],
         "tokens_by_stage": totals,
+        "cost_usd": round(sum(t["usd"] for t in totals.values()), 5),
+        "tamper_attempts": sum(bool(r.get("refused_writes") or r.get("tampered"))
+                               for r in state.get("results", [])),
         "trajectories_saved": saved,
+        "failed_trajectories_saved": saved_red,
     }
     (logs / f"graph_{state['run_id']}.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return {"summary": summary}
@@ -820,6 +1017,9 @@ def after_baseline(state: GraphState) -> str:
 
 def after_selector(state: GraphState) -> str:
     if state.get("winner"):
+        return "finalize"
+    if budget(state["run_id"]).exceeded():
+        log("[budget] spend limit reached, stopping")
         return "finalize"
     return "reflector" if state["round"] < state["max_rounds"] else "finalize"
 
@@ -846,12 +1046,16 @@ def build_graph():
 def run(repo: str, task: str, test_cmd: str = "pytest -q", branches: int = 3, rounds: int = 2,
         max_turns: int = 15, apply: bool = False, work_root: Optional[str] = None,
         make_branch: bool = True, on_log=None, full: bool = False,
-        first_green: bool = True, thinking: Optional[str] = None) -> dict:
-    """Returns the summary dict, or the full final graph state when full=True."""
+        first_green: bool = True, thinking: Optional[str] = None,
+        max_usd: Optional[float] = None) -> dict:
+    """Returns the summary dict, or the full final graph state when full=True.
+    max_usd: stop starting new LLM calls once this run has spent this much."""
     global _log_hook
     repo_dir = str(Path(repo).resolve())
     if not Path(repo_dir).is_dir():
         raise FileNotFoundError(repo_dir)
+    if max_usd is None and os.getenv("MAX_USD_PER_RUN"):
+        max_usd = float(os.environ["MAX_USD_PER_RUN"])
     state: GraphState = {
         "task": task, "repo_dir": repo_dir, "test_cmd": test_cmd,
         "work_root": work_root or str(BASE_DIR / "workspace" / "branches"),
@@ -860,8 +1064,10 @@ def run(repo: str, task: str, test_cmd: str = "pytest -q", branches: int = 3, ro
         "make_branch": make_branch,
         "first_green": first_green,
         "thinking": thinking or os.getenv("EXECUTOR_THINKING") or None,
+        "max_usd": max_usd,
         "results": [], "usage": [], "feedback": "",
     }
+    _budgets[state["run_id"]] = Budget(max_usd)
     _log_hook = on_log
     try:
         final = build_graph().invoke(state, {"recursion_limit": 10 + rounds * 6})
@@ -884,17 +1090,21 @@ def main():
                     help="Let every branch finish instead of stopping at the first green one")
     ap.add_argument("--thinking", choices=["on", "low", "off"], default=None,
                     help="Executor reasoning mode (Nemotron 3); default: model default")
+    ap.add_argument("--max-usd", type=float, default=None,
+                    help="Spend cap for this run in USD (default: MAX_USD_PER_RUN or no cap)")
     a = ap.parse_args()
 
     s = run(a.repo, a.task, a.test_cmd, a.branches, a.rounds, a.max_turns, a.apply,
-            make_branch=not a.no_branch, first_green=not a.all_branches, thinking=a.thinking)
+            make_branch=not a.no_branch, first_green=not a.all_branches, thinking=a.thinking,
+            max_usd=a.max_usd)
     print("\n=== SUMMARY ===")
     g = s.get("git") or {}
     if g.get("branch"):
         print(f"Fix committed to branch {g['branch']} ({g['commit']}). Review with:")
         print(f"  git -C {a.repo} diff HEAD {g['branch']}")
         print(f"  git -C {a.repo} merge {g['branch']}")
-    print(json.dumps({k: s[k] for k in ("status", "rounds", "winner", "git", "applied", "tokens_by_stage")}, indent=2))
+    print(json.dumps({k: s[k] for k in ("status", "rounds", "winner", "git", "applied",
+                                        "tokens_by_stage", "cost_usd", "tamper_attempts")}, indent=2))
 
 
 if __name__ == "__main__":

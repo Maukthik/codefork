@@ -14,6 +14,14 @@ WRONG = "def add(a, b):\n    return a * b\n"
 TEST = "from calc import add\n\ndef test_add():\n    assert add(2, 3) == 5\n"
 
 
+@pytest.fixture(autouse=True)
+def clean_env(monkeypatch):
+    """Your real .env must not change test results (models, spend caps, prices)."""
+    for k in ("MAX_USD_PER_RUN", "PRICES_JSON", "EXECUTOR_THINKING", "PLANNER_MODEL",
+              "EXECUTOR_MODEL", "REFLECTOR_MODEL", "ALLOW_LOCAL_SANDBOX"):
+        monkeypatch.delenv(k, raising=False)
+
+
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
     monkeypatch.setenv("SANDBOX", "local")
@@ -218,10 +226,17 @@ class FakeImage:
     def _exec(self, shell, overlay):
         if "pip install" in shell:
             return FakeImage(self.files, self.log)
-        inner = shlex.split(shell)[-1]          # cd /app && timeout N sh -c '<inner>'
+        tokens = shlex.split(shell)
+        inner = tokens[-1]                      # cd /app && [rm -f -- x &&] timeout N sh -c '<inner>'
+        deleted = []
+        if "rm" in tokens:                      # deletions the branch made
+            i = tokens.index("--") + 1
+            deleted = tokens[i:tokens.index("&&", i)]
         root = Path(tempfile.mkdtemp())
         allfiles = dict(self.files)
         allfiles.update({k: Path(v).read_bytes() for k, v in overlay.items()})
+        for rel in deleted:
+            allfiles.pop(f"app/{rel}", None)
         for key, data in allfiles.items():
             p = root / key
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -237,6 +252,7 @@ def fake_nebius(monkeypatch, tmp_path):
     monkeypatch.setenv("NEBIUS_PROJECT_ID", "test")
     monkeypatch.setattr(ag, "BASE_DIR", tmp_path)
     ag._base_cache.clear()
+    monkeypatch.setitem(__import__("sys").modules, "contree_sdk", SimpleNamespace())  # sandbox_ready() import check
     calls = []
     client = SimpleNamespace(images=SimpleNamespace(use=lambda name: FakeImage({}, calls)))
     monkeypatch.setattr(ag, "_contree_client", lambda: client)
@@ -351,10 +367,13 @@ def test_repo_context_puts_mentioned_files_first(tmp_path):
 
 
 def test_thinking_switch_falls_back_if_provider_rejects(monkeypatch):
+    class BadRequest(Exception):
+        status_code = 400
+
     class Completions:
         def create(self, **kw):
             if "extra_body" in kw:
-                raise ValueError("unknown field")
+                raise BadRequest("unknown field")
             m = SimpleNamespace(content="ok", tool_calls=None)
             return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
                                    choices=[SimpleNamespace(message=m, finish_reason="stop")])
@@ -363,3 +382,190 @@ def test_thinking_switch_falls_back_if_provider_rejects(monkeypatch):
     monkeypatch.setattr(ag, "_thinking_unsupported", False)
     m, usage = ag.chat("m", [{"role": "user", "content": "hi"}], thinking="off", max_tokens=100)
     assert m.content == "ok" and ag._thinking_unsupported
+
+def test_rate_limit_does_not_disable_thinking_switch(monkeypatch):
+    class RateLimited(Exception):
+        status_code = 429
+    class Completions:
+        def create(self, **kw):
+            raise RateLimited("slow down")
+    fake = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    monkeypatch.setattr(ag, "get_client", lambda: fake)
+    monkeypatch.setattr(ag, "_thinking_unsupported", False)
+    with pytest.raises(RateLimited):
+        ag.chat("m", [{"role": "user", "content": "hi"}], thinking="off")
+    assert not ag._thinking_unsupported
+
+
+# --- tamper guard -------------------------------------------------------------
+
+def plan_then(executor_turns):
+    """Fake chat: planner returns one strategy, executor replays executor_turns, then 'done'."""
+    seen = {"n": 0}
+    def fake(model, messages, tools=None, **kw):
+        if "planner" in messages[0]["content"]:
+            return msg(json.dumps({"strategies": ["s"]})), (1, 1)
+        if "reflector" in messages[0]["content"]:
+            return msg("nope"), (1, 1)
+        seen["n"] += 1
+        if seen["n"] <= len(executor_turns):
+            return msg("", executor_turns[seen["n"] - 1]), (1, 1)
+        return msg("done"), (1, 1)
+    return fake
+
+
+def test_is_protected():
+    for rel in ["test_calc.py", "calc_test.py", "conftest.py", "pytest.ini", "pyproject.toml",
+                "tests/helpers.py", "pkg/tests/data.json"]:
+        assert ag.is_protected(rel), rel
+    for rel in ["calc.py", "testing_utils.py", "src/contest.py", "latest.py"]:
+        assert not ag.is_protected(rel), rel
+
+
+def test_writing_a_test_file_is_refused(repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(ag, "chat", plan_then([
+        [call("write_file", path="test_calc.py", content="def test_add():\n    pass\n")]]))
+    s = ag.run(str(repo), "fix", branches=1, rounds=1, work_root=str(tmp_path / "b"),
+               make_branch=False, full=True)
+    r = s["results"][0]
+    assert not r["passed"] and r["refused_writes"] == 1
+    assert s["summary"]["status"] == "red" and s["summary"]["tamper_attempts"] == 1
+    assert (repo / "test_calc.py").read_text() == TEST
+
+
+def test_test_edited_through_shell_is_reverted(repo, tmp_path, monkeypatch):
+    """SANDBOX=local runs shell commands in the branch dir, so they can edit files directly."""
+    edit = "python -c \"open('test_calc.py','w').write('def test_add():\\n    pass\\n')\""
+    monkeypatch.setattr(ag, "chat", plan_then([
+        [call("run_command", command=edit), call("write_file", path="notes.py", content="x = 1\n")]]))
+    s = ag.run(str(repo), "fix", branches=1, rounds=1, work_root=str(tmp_path / "b"),
+               make_branch=False, full=True)
+    r = s["results"][0]
+    assert not r["passed"] and r["tampered"] == ["test_calc.py"]
+    assert "test_calc.py" not in r["changed"]            # the patch never contains test edits
+
+
+def test_new_conftest_is_removed(repo, tmp_path, monkeypatch):
+    skip_all = "import pytest\n\ndef pytest_collection_modifyitems(items):\n    items.clear()\n"
+    monkeypatch.setattr(ag, "chat", plan_then([
+        [call("run_command", command="python -c \"open('conftest.py','w').write('x')\""),
+         call("write_file", path="notes.py", content="x = 1\n")]]))
+    s = ag.run(str(repo), "fix", branches=1, rounds=1, work_root=str(tmp_path / "b"),
+               make_branch=False, full=True)
+    assert s["results"][0]["tampered"] == ["conftest.py"] and not s["results"][0]["passed"]
+
+
+def test_model_reported_green_does_not_count(repo, tmp_path, monkeypatch):
+    """'pytest -q || true' exits 0 but proves nothing; only the judge can mark green."""
+    monkeypatch.setattr(ag, "chat", plan_then([
+        [call("write_file", path="notes.py", content="x = 1\n"),
+         call("run_command", command="pytest -q || true")]]))
+    s = ag.run(str(repo), "fix", branches=1, rounds=1, work_root=str(tmp_path / "b"),
+               make_branch=False)
+    assert s["status"] == "red"
+
+
+def test_skipping_tests_from_source_does_not_count(repo, tmp_path, monkeypatch):
+    """All tests skipped exits 0, but fewer tests pass than existed at baseline."""
+    skipper = "import pytest\n\ndef add(a, b):\n    pytest.skip('nope')\n"   # exits 0: '1 skipped'
+    monkeypatch.setattr(ag, "chat", plan_then([
+        [call("write_file", path="calc.py", content=skipper)]]))
+    s = ag.run(str(repo), "fix", branches=1, rounds=1, work_root=str(tmp_path / "b"),
+               make_branch=False, full=True)
+    r = s["results"][0]
+    assert not r["passed"] and "[judge]" in r["test_output"]
+
+
+def test_pytest_counts():
+    assert ag.pytest_counts("..F\n1 failed, 2 passed in 0.1s") == {"failed": 1, "passed": 2}
+    assert ag.pytest_counts("= 3 passed, 1 skipped, 2 errors in 1s =") == {
+        "passed": 3, "skipped": 1, "error": 2}
+    assert ag.pytest_counts("hello") == {}
+
+
+# --- patch, deletions, cost -----------------------------------------------------------
+
+def test_patch_applies_with_git_when_files_lack_final_newline(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(); b.mkdir()
+    # write_bytes everywhere: write_text would add \r on Windows
+    (a / "one.py").write_bytes(b"x = 1")               # no trailing newline
+    (b / "one.py").write_bytes(b"x = 2")
+    (a / "two.py").write_bytes(b"y = 1\n")
+    (b / "two.py").write_bytes(b"y = 2\n")
+    patch = ag.make_diff(str(a), str(b))["patch"]
+    (tmp_path / "fix.patch").write_bytes(patch.encode())
+    sh(a, "init", "-q")
+    sh(a, "config", "core.autocrlf", "false")         # Windows git would rewrite LF as CRLF on apply
+    subprocess.run(["git", "-C", str(a), "apply", str(tmp_path / "fix.patch")], check=True)
+    assert (a / "one.py").read_bytes() == b"x = 2" and (a / "two.py").read_bytes() == b"y = 2\n"
+
+
+def test_deleted_file_is_removed_in_nebius_sandbox(fake_nebius, tmp_path):
+    r = tmp_path / "repo"; r.mkdir()
+    (r / "calc.py").write_text(FIXED); (r / "test_calc.py").write_text(TEST)
+    (r / "test_broken.py").write_text("def test_x():\n    assert False\n")
+    b = tmp_path / "branch"
+    ag.copy_repo(str(r), str(b))
+    (b / "test_broken.py").unlink()
+    code, out = ag.run_in_sandbox(str(b), "python -m pytest -q")
+    assert code == 0 and "1 passed" in out
+
+
+def test_cost_usd_uses_price_table(monkeypatch):
+    assert ag.cost_usd("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B", 1_000_000, 1_000_000) == pytest.approx(0.30)
+    assert ag.cost_usd("nvidia/Nemotron-3-Ultra-550b-a55b", 1_000_000, 0) == pytest.approx(1.0)
+    assert ag.cost_usd("llama3.1:8b", 10**6, 10**6) == 0
+    monkeypatch.setenv("PRICES_JSON", '{"llama": [1, 1]}')
+    assert ag.cost_usd("llama3.1:8b", 10**6, 0) == pytest.approx(1.0)
+
+
+def test_budget_cap_stops_run(repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("EXECUTOR_MODEL", "x-ultra")   # stage models only apply to nebius
+    monkeypatch.setenv("PROVIDER", "nebius")
+    def pricey(model, messages, tools=None, **kw):
+        if "planner" in messages[0]["content"]:
+            return msg(json.dumps({"strategies": ["a", "b"]})), (10, 10)
+        return msg("", [call("write_file", path="calc.py", content=WRONG)]), (1_000_000, 0)  # $1/turn
+    monkeypatch.setattr(ag, "chat", pricey)
+    s = ag.run(str(repo), "fix", branches=2, rounds=3, max_turns=10, max_usd=1.5,
+               work_root=str(tmp_path / "b"), make_branch=False, full=True)
+    assert s["summary"]["status"] == "red" and s["summary"]["rounds"] == 1   # no second round
+    assert sum(r["turns"] for r in s["results"]) <= 4
+    assert all(r["stop_reason"] in ("budget", "gave up") for r in s["results"])
+
+
+def test_patch_applies_to_crlf_files(tmp_path):
+    """Windows-created repos use CRLF; the patch must keep it or git apply fails."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(); b.mkdir()
+    (a / "calc.py").write_bytes(BUGGY.replace("\n", "\r\n").encode())
+    (b / "calc.py").write_bytes(FIXED.replace("\n", "\r\n").encode())
+    (tmp_path / "fix.patch").write_bytes(ag.make_diff(str(a), str(b))["patch"].encode())
+    sh(a, "init", "-q")
+    sh(a, "config", "core.autocrlf", "false")
+    subprocess.run(["git", "-C", str(a), "apply", str(tmp_path / "fix.patch")], check=True)
+    assert (a / "calc.py").read_bytes() == FIXED.replace("\n", "\r\n").encode()
+
+
+def test_write_file_keeps_line_endings(tmp_path):
+    (tmp_path / "lf.py").write_bytes(b"x = 1\n")
+    (tmp_path / "crlf.py").write_bytes(b"x = 1\r\n")
+    ag.run_tool(str(tmp_path), "write_file", {"path": "lf.py", "content": "x = 2\ny = 3\n"})
+    ag.run_tool(str(tmp_path), "write_file", {"path": "crlf.py", "content": "x = 2\ny = 3\n"})
+    ag.run_tool(str(tmp_path), "write_file", {"path": "new.py", "content": "z = 1\n"})
+    assert (tmp_path / "lf.py").read_bytes() == b"x = 2\ny = 3\n"       # no \r added on Windows
+    assert (tmp_path / "crlf.py").read_bytes() == b"x = 2\r\ny = 3\r\n"
+    assert (tmp_path / "new.py").read_bytes() == b"z = 1\n"
+    assert ag.make_diff(str(tmp_path), str(tmp_path))["lines"] == 0
+
+
+def test_saved_winner_patch_is_byte_exact(repo, tmp_path, monkeypatch):
+    """The patch file on disk must be exactly the patch (no \r added on Windows)."""
+    monkeypatch.setattr(ag, "chat", make_fake_chat([["GOOD fix"]]))
+    s = ag.run(str(repo), "fix", branches=1, rounds=1, work_root=str(tmp_path / "b"),
+               make_branch=False, full=True)
+    saved = (tmp_path / "logs" / f"graph_{s['run_id']}_winner.patch").read_bytes()
+    # A CRLF repo (write_text on Windows) legitimately gives CRLF lines; what must never
+    # happen is text-mode writing adding a second \r (\r\r\n) or \r to LF lines.
+    assert saved == s["winner"]["patch"].encode() and b"\r\r\n" not in saved

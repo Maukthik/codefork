@@ -1,177 +1,183 @@
 <div align="center">
 
-# 🍴 Project Fork
+# 🍴 Fork: Red to Green
 
-**An autonomous coding agent that plans, writes, tests and fixes its own code, all inside a sandbox.**
+**A coding agent that turns failing tests green by trying several fixes in parallel, in forked cloud sandboxes, and keeping the smallest one that passes.**
 
-*Next step: fork the sandbox to try several strategies in parallel and keep the one that passes the tests.*
-
-![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
-![Nebius](https://img.shields.io/badge/Nebius-Token%20Factory-7B61FF)
-![NVIDIA Nemotron](https://img.shields.io/badge/NVIDIA-Nemotron-76B900?logo=nvidia&logoColor=white)
-![Docker](https://img.shields.io/badge/sandbox-Docker%20%7C%20Nebius-2496ED?logo=docker&logoColor=white)
+[![tests](https://github.com/Maukthik/codefork/actions/workflows/tests.yml/badge.svg)](https://github.com/Maukthik/codefork/actions/workflows/tests.yml)
+![Python](https://img.shields.io/badge/python-3.12+-3776AB?logo=python&logoColor=white)
+![NVIDIA Nemotron](https://img.shields.io/badge/NVIDIA-Nemotron%203-76B900?logo=nvidia&logoColor=white)
+![Nebius](https://img.shields.io/badge/Nebius-Token%20Factory%20%2B%20Sandboxes-7B61FF)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-*Built for the **Coding and Agentic Engineering** hackathon track.*
+*Nebius x NVIDIA Global AI Hackathon, **Coding and Agentic Engineering** track*
+
+**[Demo video](#) · [Live demo](#)**
 
 </div>
 
 ---
 
-## ✨ What it does
+## What it does
 
-Give Project Fork a task in plain English, for example *"write a function that parses ISO dates, with pytest tests"*. The agent then:
+Point Fork at a repo with failing tests. It:
 
-1. 🧭 **Plans:** breaks the task into small steps, each with a success check.
-2. 🛠️ **Executes:** writes files and runs commands inside an isolated sandbox.
-3. 🔍 **Reflects:** when a command fails, it diagnoses why and remembers which approaches already failed.
-4. 🔁 **Recovers:** retries with a different approach and never repeats a known-bad fix.
-5. 📦 **Delivers:** copies the finished files into your local `workspace/` folder and logs every action.
+1. **Plans.** NVIDIA Nemotron 3 Ultra reads the code and the failing output and proposes *N genuinely different* fix strategies.
+2. **Forks.** The repo is uploaded once as a Nebius sandbox checkpoint. Every strategy gets its own branch that forks from that checkpoint, so branches run in parallel and never see each other's edits.
+3. **Executes.** In each branch, Nemotron 3 Nano edits files and the tests re-run automatically after every edit, in the sandbox.
+4. **Judges.** A branch is green only when the *original, untouched* tests pass (see [tamper guard](#tamper-guard)). The first green branch cancels the others.
+5. **Reflects.** If no branch is green, Nemotron 3 Ultra explains what went wrong and the next round plans with that feedback.
+6. **Hands you a review branch.** The smallest passing diff is committed to `fork/fix-<run>` in your repo using a temporary git worktree. Your checkout is never touched until you approve.
 
-## 🧠 How it works
+A real run on the included invoice demo: 3 parallel branches, all green, 10-line winning diff across 2 files, about 57k tokens, **about one US cent**.
+
+## How it works
 
 ```mermaid
-flowchart TD
-    task([Your task]) --> planner[Planner]
-    planner -- "plan: up to 6 steps" --> executor[Executor]
-    executor <-- "write · read · run" --> sandbox[(Sandbox)]
-    executor -- "a command failed" --> reflector[Reflector]
-    reflector -- "diagnosis" --> executor
-    executor -- "all steps done" ----> result([Files in workspace/])
+flowchart LR
+    B[Baseline<br/>run tests in sandbox] -->|red| P[Planner<br/>Nemotron 3 Ultra]
+    B -->|already green| F
+    P -->|N strategies| E1[Executor b0<br/>Nemotron 3 Nano]
+    P --> E2[Executor b1]
+    P --> E3[Executor b2]
+    E1 & E2 & E3 --> S[Selector<br/>smallest green diff]
+    S -->|winner| F[Finalize<br/>review branch + patch + trajectories]
+    S -->|none green, rounds left| R[Reflector<br/>Nemotron 3 Ultra] --> P
 ```
 
-1. **Planner** turns your task into up to 6 small steps, each with a success check.
-2. **Executor** works through the steps one at a time, writing files and running commands in the **sandbox**.
-3. **Reflector** steps in when a command fails. It explains what went wrong and keeps a list of approaches that already failed, so the executor tries something new.
-4. When every step is done, the files are copied to `workspace/` and the whole run is saved to `logs/`.
+Built as a [LangGraph](https://github.com/langchain-ai/langgraph) `StateGraph`. The parallel fan-out uses `Send`, one per strategy.
 
-**Built-in safety**
-- 🔒 The agent can't read or write files outside its workspace.
-- ⏱️ Each task is capped at **25 model turns**.
-- 🧮 Token usage is tracked separately for each stage.
-- 💤 If the agent re-runs a failed command without changing any code, the reflector isn't called again, which saves tokens.
+| Piece | File |
+|---|---|
+| Graph, nodes, sandbox, tamper guard, cost tracking | `agent_graph.py` |
+| Streamlit UI: run, watch live, compare branches, approve or reject | `graph_app.py` |
+| Offline test suite (fake LLM, fake sandbox, 38 tests) | `test_agent_graph.py` |
+| Demo repos with planted bugs | `examples/` |
 
-## 📦 Sandboxes
+## How NVIDIA Nemotron and Nebius are used
 
-Both backends expose the same interface (`start`, `write_file`, `read_file`, `run`, `finish`), so the agent doesn't care which one is running.
-
-| Backend | `SANDBOX=` | Best for |
+| | What | Why |
 |---|---|---|
-| 🐳 **Docker** *(default)* | `docker` | Free, fast, offline local development. Python 3.12 + pytest with resource limits. |
-| ☁️ **Nebius Sandboxes** | `nebius` | VM-isolated cloud runs. Every command is saved as a snapshot you can branch from, which is the basis for parallel forking. |
+| **Nemotron 3 Ultra** (`nvidia/Nemotron-3-Ultra-550b-a55b`) | Planner and reflector | Few calls, needs the best reasoning: root-cause hypotheses and failure analysis |
+| **Nemotron 3 Nano** (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) | Executor (the many edit and test turns) | Fast and cheap, so trying 3 strategies in parallel costs less than one big-model attempt |
+| **Nemotron 3 Super** (`nvidia/nemotron-3-super-120b-a12b`) | Default for any stage without its own model | Middle ground |
+| **Nemotron reasoning switch** | `chat_template_kwargs` `enable_thinking` / `low_effort` | Executor runs with thinking `off` or `low` for speed; falls back cleanly if unsupported |
+| **Nebius Token Factory** | OpenAI-compatible inference for every model call | One endpoint for all three Nemotron sizes |
+| **Nebius Token Factory Sandboxes** (`contree-sdk`) | Every test and command runs in an isolated cloud sandbox | The repo becomes one checkpoint and each branch overlays only its changed files, so parallel branches are cheap and isolated |
 
-## 🚀 Quickstart
+Every run reports tokens and **USD cost per stage**, and you can cap spend per run (`--max-usd`).
+
+## Tamper guard
+
+An agent that is rewarded for green tests will, sooner or later, "fix" the tests. Fork makes that impossible to win with:
+
+- **Read-only tests.** Writes to `test_*.py`, `*_test.py`, `conftest.py`, `tests/`, `pytest.ini`, `pyproject.toml` and similar are refused.
+- **Restore before judging.** Before every test run that counts, protected files are restored from the original repo. Edits made through shell commands are undone, and new files such as a `conftest.py` that deselects everything are deleted.
+- **Only the judge decides.** The model's own test runs are informational. `pytest -q || true` exiting 0 doesn't make a branch green.
+- **No skipping your way out.** For pytest, at least as many tests must pass as existed at baseline, so skipped or deselected tests don't count.
+- **Visible.** Refused and reverted edits are counted per branch and shown in the UI and the run summary.
+
+Each rule has a test in `test_agent_graph.py`.
+
+## Quickstart
 
 ```bash
-# 1. Set up the environment
+git clone https://github.com/Maukthik/codefork.git && cd codefork
 python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-# 2. Build the local sandbox image (Docker backend)
-docker build -t fork-sandbox sandbox
+cp .env.example .env                 # Windows: copy .env.example .env
+# fill in NEBIUS_API_KEY and NEBIUS_PROJECT_ID
+python scripts/list_models.py        # check your key and the exact Nemotron model ids
+python scripts/hello_sandbox.py      # check the Nebius sandbox works
 
-# 3. Configure your keys and models
-cp .env.example .env               # Windows: copy .env.example .env
-python list_models.py              # see which models your key can use
-python check_connection.py         # quick model round-trip
-
-# 4. Run it
-python agent.py                    # terminal
-streamlit run app.py               # web UI
+python scripts/make_demo.py          # creates workspace/invoice (a git repo with 3 planted bugs)
 ```
 
-Generated code is written to `workspace/`, and run logs go to `logs/run_<timestamp>.jsonl`.
+**Web UI**
 
-## ⚙️ Configuration
-
-Copy `.env.example` to `.env` and fill it in. A typical setup (Nemotron on Nebius, code running in local Docker) needs only four lines:
-
-```ini
-PROVIDER=nebius
-NEBIUS_API_KEY=your-key-here
-NEBIUS_MODEL=a-nemotron-model-from-list_models.py
-SANDBOX=docker
+```bash
+streamlit run graph_app.py
 ```
 
-Everything else is optional.
+**CLI**
 
-### 1. Where the model runs
+```bash
+python agent_graph.py --repo workspace/invoice --branches 3 --rounds 2 --max-usd 0.25
+git -C workspace/invoice diff main fork/fix-<run_id>     # review
+git -C workspace/invoice merge fork/fix-<run_id>         # accept
+```
 
-| Variable | Needed when | Default |
+| Flag | Default | Meaning |
 |---|---|---|
-| `PROVIDER` | always | `ollama` |
-| `NEBIUS_API_KEY` | `PROVIDER=nebius` | – |
-| `NEBIUS_MODEL` | `PROVIDER=nebius` | – |
-| `NEBIUS_BASE_URL` | using a different Nebius region | UK-South endpoint |
-| `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` | `PROVIDER=openrouter` | – |
-| `OLLAMA_URL`, `OLLAMA_MODEL` | `PROVIDER=ollama` | `http://localhost:11434/v1`, `llama3.1:8b-instruct-q4_K_M` |
+| `--branches` | 3 | Parallel strategies per round |
+| `--rounds` | 2 | Plan, execute, reflect cycles |
+| `--max-turns` | 15 | Model turns per branch |
+| `--thinking` | model default | Executor reasoning: `on`, `low`, `off` |
+| `--all-branches` | off | Let every branch finish instead of stopping at the first green one |
+| `--max-usd` | `MAX_USD_PER_RUN` | Stop starting new model calls after this spend |
+| `--apply` | off | Also copy the fix into the working tree |
+| `--no-branch` | off | Patch file only, no git branch |
 
-### 2. A different model per stage *(optional)*
+## Output
 
-Leave these blank to use the main model for everything.
-
-| Variable | Used by |
+| Path | Contents |
 |---|---|
-| `PLANNER_MODEL` | Planner |
-| `EXECUTOR_MODEL` | Executor |
-| `REFLECTOR_MODEL` | Reflector |
+| `fork/fix-<run_id>` branch in the target repo | The winning fix, with strategy, diff size and test result in the commit message |
+| `logs/graph_<run_id>.json` | Summary: status, every branch, tokens and USD by stage, tamper attempts |
+| `logs/graph_<run_id>_winner.patch` | The fix as a `git apply`-able patch |
+| `logs/trajectories/*.json` | Full conversations of green branches (fine-tuning data); red ones in `failed/` |
 
-### 3. Where the code runs
+## Configuration
 
-| Variable | Needed when | Default |
+All settings live in `.env` (see `.env.example`). The important ones:
+
+| Variable | Default | |
 |---|---|---|
-| `SANDBOX` | always | `docker` |
-| `SANDBOX_IMAGE` | using a custom Docker image | `fork-sandbox` |
-| `NEBIUS_PROJECT_ID` | `SANDBOX=nebius` | – |
-| `NEBIUS_SANDBOX_IMAGE` | using a custom Nebius image | `python:3.12-slim` |
+| `NEBIUS_API_KEY`, `NEBIUS_PROJECT_ID` | – | Token Factory key and project (the project is needed for sandboxes) |
+| `PLANNER_MODEL`, `EXECUTOR_MODEL`, `REFLECTOR_MODEL` | `NEBIUS_MODEL` | Model per stage |
+| `EXECUTOR_THINKING` | model default | `on`, `low` or `off` |
+| `SANDBOX` | `nebius` | `local` runs commands on your machine. Only for tests and trusted repos; hidden in the UI unless `ALLOW_LOCAL_SANDBOX=1` |
+| `SANDBOX_IMAGE` | `python:3.12-slim` | Base image for the sandbox checkpoint |
+| `MAX_USD_PER_RUN` | no cap | Default spend cap |
+| `PRICES_JSON` | Nano $0.06/$0.24, Super $0.30/$0.90, Ultra $1/$3 per 1M tokens | Override the price table |
 
-## 🧪 Tests
-
-```bash
-pytest
-```
-
-The test suite scripts the model's replies, so it needs **no API key and no network**. It covers the planner, the reflector, the recovery loop, the turn limit, per-stage model routing, token counting and the Nebius backend.
-
-## 🔎 Inspecting a run
+## Tests
 
 ```bash
-python summarize_log.py                              # latest run
-python summarize_log.py logs/run_20260923_131622.jsonl
+python -m pytest -q
 ```
 
-This prints the task, the models used, the plan, each tool call (ok / FAILED) and every reflection.
+38 tests. They script the model's replies and fake the Nebius sandbox, so they need **no API key, no network and no credits**, and they run in CI on every push. They cover the graph (branching, reflection, first-green cancellation, budget cap), the tamper guard, the Nebius checkpoint and overlay logic, git review branches, patch output and line endings.
 
-## 🗂️ Project layout
+## Project layout
 
 ```
 .
-├── agent.py              # Planner → Executor → Reflector loop
-├── sandboxes.py          # Docker and Nebius sandbox backends
-├── app.py                # Streamlit web UI
-├── sandbox/dockerfile    # Sandbox image: Python 3.12 + pytest
-├── test_agent.py         # Offline test suite
-├── summarize_log.py      # Readable summary of a JSONL run log
-├── list_models.py        # List models available to your key
-├── check_connection.py   # Model connectivity check
-└── check_sandbox.py      # Nebius sandbox connectivity check
+├── agent_graph.py          # the agent (LangGraph)
+├── graph_app.py            # Streamlit UI
+├── test_agent_graph.py     # offline tests
+├── examples/               # demo repos with planted bugs
+├── scripts/                # make_demo, list_models, connectivity checks
+├── legacy/                 # first single-agent version (planner, executor, reflector loop)
+└── .github/workflows/      # CI
 ```
 
-## 🗺️ Roadmap
+## Roadmap
 
-- [x] Tool-using agent loop (write file, read file, run command)
-- [x] Self-correction: runs its own code and fixes errors
-- [x] Turn limit and JSONL logging of every action
-- [x] Docker sandbox with pytest and resource limits
-- [x] Planner and Reflector with structured outputs
-- [x] Per-stage models (NVIDIA Nemotron on Nebius Token Factory)
-- [x] Nebius Sandboxes backend with snapshots
-- [x] Streamlit web interface
-- [ ] 🍴 **Parallel branching:** fork Nebius snapshots, try several strategies at once, keep the one that passes
-- [ ] Fine-tuned Nemotron executor
-- [ ] Benchmark
+- [x] Single-agent loop with planner, executor, reflector (`legacy/`)
+- [x] LangGraph rewrite with parallel branches forked from one Nebius sandbox checkpoint
+- [x] Per-stage Nemotron models, reasoning switch, first-green cancellation
+- [x] Review branch via git worktree, Streamlit approve or reject
+- [x] Tamper guard, USD cost tracking and spend cap, trajectory logging, CI
+- [ ] Model escalation: Nano, then Super, then Ultra for later rounds
+- [ ] Harder multi-file demo repo
+- [ ] Benchmark on SWE-rebench
+- [ ] Build mode: prompt, then tests, then code
+- [ ] Fine-tuned Nemotron executor from collected trajectories
+- [ ] GitHub Action: run Fork on a failing CI build and open a PR
 
-## 📄 License
+## License
 
 [MIT](LICENSE)

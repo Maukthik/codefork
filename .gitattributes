@@ -1,0 +1,2 @@
+# Keep LF in the repo so agent patches are consistent on every OS
+* text=auto eol=lf

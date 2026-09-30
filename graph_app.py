@@ -91,7 +91,8 @@ running = bool(job and not job["done"])
 
 with st.sidebar:
     st.header("Run settings")
-    repo = st.text_input("Repo path", "workspace/demo", help="A folder with failing tests")
+    repo = st.text_input("Repo path", "workspace/invoice",
+                         help="A folder with failing tests. Create the demos with: python scripts/make_demo.py")
     task = st.text_area("Task", "Make the failing tests pass without changing the tests.", height=90)
     test_cmd = st.text_input("Test command", "pytest -q")
     branches = st.slider("Parallel branches", 1, 5, 3)
@@ -102,12 +103,21 @@ with st.sidebar:
     thinking = st.radio("Executor thinking", ["on", "low", "off"], horizontal=True,
                         index=["on", "low", "off"].index(os.getenv("EXECUTOR_THINKING", "off")),
                         help="Nemotron reasoning mode. off/low = faster and fewer tokens, may be less accurate.")
-    sandbox = st.radio("Sandbox", ["nebius", "local"], horizontal=True,
-                       index=1 if os.getenv("SANDBOX", "nebius") == "local" else 0,
-                       help="nebius: Token Factory Sandboxes (default). "
-                            "local: runs on your machine, only for trusted demo repos")
-    st.caption(f"Provider: {os.getenv('PROVIDER', 'nebius')} | executor: {ag.stage_model('executor') or '?'}")
-    os.environ["SANDBOX"] = sandbox
+    max_usd = st.number_input("Spend cap for this run (USD)", 0.0, 20.0,
+                              float(os.getenv("MAX_USD_PER_RUN", "0.50")), 0.05,
+                              help="The agent stops starting new model calls once a run has spent this much.")
+    # Running agent-written commands on this machine is only for local development.
+    # A hosted demo must never offer it, so it's hidden unless ALLOW_LOCAL_SANDBOX=1.
+    if os.getenv("ALLOW_LOCAL_SANDBOX") == "1":
+        sandbox = st.radio("Sandbox", ["nebius", "local"], horizontal=True,
+                           index=1 if os.getenv("SANDBOX", "nebius") == "local" else 0,
+                           help="nebius: Token Factory Sandboxes (default). "
+                                "local: runs on your machine, only for trusted demo repos")
+        os.environ["SANDBOX"] = sandbox
+    else:
+        os.environ["SANDBOX"] = "nebius"
+    st.caption(f"Provider: {os.getenv('PROVIDER', 'nebius')} | planner: {ag.stage_model('planner') or '?'} "
+               f"| executor: {ag.stage_model('executor') or '?'} | sandbox: {os.environ['SANDBOX']}")
 
 repo_dir = str(Path(repo).resolve())
 repo_ok = Path(repo_dir).is_dir()
@@ -150,7 +160,7 @@ if st.button("Run agent", type="primary", disabled=running):
     ss.job, ss.decision = job, None
     kwargs = dict(repo=repo_dir, task=task, test_cmd=test_cmd, branches=branches,
                   rounds=rounds, max_turns=max_turns, first_green=first_green,
-                  thinking=None if thinking == "on" else thinking)
+                  thinking=None if thinking == "on" else thinking, max_usd=max_usd or None)
     threading.Thread(target=worker, args=(job, kwargs), daemon=True).start()
     running = True
 
@@ -187,11 +197,15 @@ if job and job["done"]:
         st.stop()
 
     tokens = sum(v["input"] + v["output"] for v in summary["tokens_by_stage"].values())
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Result", summary["status"].upper())
     m2.metric("Rounds", summary["rounds"])
     m3.metric("Branches tried", len(results))
     m4.metric("Total tokens", f"{tokens:,}")
+    m5.metric("Cost", f"${summary.get('cost_usd', 0):.4f}")
+    if summary.get("tamper_attempts"):
+        st.warning(f"{summary['tamper_attempts']} branch(es) tried to change the tests. "
+                   "Those edits were refused or reverted before judging.")
     st.caption(f"Finished in {job.get('elapsed', 0):.0f}s. "
                f"{summary.get('trajectories_saved', 0)} winning run(s) saved to logs/trajectories for fine-tuning.")
 
@@ -207,7 +221,11 @@ if job and job["done"]:
                 st.markdown(f"**{r['branch_id']}** {badge}{'  🏆 winner' if win else ''}")
                 st.caption(r["strategy"])
                 st.write(f"{r['turns']} turns, {r['tool_calls']} tool calls, {r['diff_lines']} diff lines, "
-                         f"{r['input_tokens'] + r['output_tokens']:,} tokens")
+                         f"{r['input_tokens'] + r['output_tokens']:,} tokens, ${r.get('usd', 0):.4f}")
+                st.caption(f"model: {(r.get('model') or '?').split('/')[-1]} | stop: {r.get('stop_reason')}")
+                if r.get("refused_writes") or r.get("tampered"):
+                    st.caption(f":orange[tamper guard: {r.get('refused_writes', 0)} refused, "
+                               f"reverted {r.get('tampered') or []}]")
                 with st.expander("Diff"):
                     st.code(r["patch"] or "(no changes)", language="diff")
                 with st.expander("Test output"):
