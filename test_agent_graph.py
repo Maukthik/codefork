@@ -767,3 +767,45 @@ def test_planner_thinking_setting_is_passed(repo, tmp_path, monkeypatch):
     monkeypatch.setattr(ag, "chat", fake)
     ag.run(str(repo), "fix", branches=1, rounds=1, work_root=str(tmp_path / "b"), make_branch=False)
     assert seen["thinking"] == "low"
+
+
+# --- network resilience -------------------------------------------------------------
+
+class ConnectTimeout(Exception):
+    """Stands in for contree_sdk's ApiTimeoutError(timeout_type='connect')."""
+
+
+def test_sandbox_retries_transient_errors(fake_nebius, tmp_path, monkeypatch):
+    monkeypatch.setattr(ag, "_sleep", lambda s: None)
+    r = tmp_path / "repo"; r.mkdir()
+    (r / "calc.py").write_text(FIXED); (r / "test_calc.py").write_text(TEST)
+    real_apply, fails = FakeImage.apply_files, {"n": 2}
+    def flaky_apply(self, mapping):
+        if fails["n"]:
+            fails["n"] -= 1
+            raise ConnectTimeout("timeout_type='connect'")
+        return real_apply(self, mapping)
+    monkeypatch.setattr(FakeImage, "apply_files", flaky_apply)
+    code, out = ag.run_in_sandbox(str(r), "python -m pytest -q")
+    assert code == 0 and fails["n"] == 0                        # two failures, third try worked
+
+
+def test_sandbox_gives_clear_error_when_unreachable(fake_nebius, tmp_path, monkeypatch):
+    monkeypatch.setattr(ag, "_sleep", lambda s: None)
+    r = tmp_path / "repo"; r.mkdir()
+    (r / "calc.py").write_text(FIXED)
+    def down(self, mapping):
+        raise ConnectTimeout("connect timeout")
+    monkeypatch.setattr(FakeImage, "apply_files", down)
+    with pytest.raises(ag.SandboxUnavailable, match="hello_sandbox"):
+        ag.run_in_sandbox(str(r), "python -m pytest -q")
+
+
+def test_real_errors_are_not_retried(monkeypatch):
+    calls = {"n": 0}
+    def bad():
+        calls["n"] += 1
+        raise ValueError("bad image name")
+    with pytest.raises(ValueError):
+        ag.with_retry(bad, "x")
+    assert calls["n"] == 1

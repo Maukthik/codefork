@@ -53,7 +53,7 @@ Built as a [LangGraph](https://github.com/langchain-ai/langgraph) `StateGraph`. 
 |---|---|
 | Graph, nodes, sandbox, tamper guard, cost tracking | `agent_graph.py` |
 | Streamlit UI: run, watch live, compare branches, approve or reject | `graph_app.py` |
-| Offline test suite (fake LLM, fake sandbox, 53 tests) | `test_agent_graph.py` |
+| Offline test suite (fake LLM, fake sandbox, 56 tests) | `test_agent_graph.py` |
 | Demo repos with planted bugs: `invoice` (3 bugs, 2 files), `bookstore` (7 bugs, 5 modules) | `examples/` |
 
 ## How NVIDIA Nemotron and Nebius are used
@@ -167,7 +167,7 @@ All settings live in `.env` (see `.env.example`). The important ones:
 python -m pytest -q
 ```
 
-53 tests. They script the model's replies and fake the Nebius sandbox, so they need **no API key, no network and no credits**, and they run in CI on every push. They cover the graph (branching, reflection, first-green cancellation, budget cap, escalation, partial-fix merging, carrying progress between rounds), the tamper guard, the Nebius checkpoint and overlay logic, git review branches, patch output and line endings.
+56 tests. They script the model's replies and fake the Nebius sandbox, so they need **no API key, no network and no credits**, and they run in CI on every push. They cover the graph (branching, reflection, first-green cancellation, budget cap, escalation, partial-fix merging, carrying progress between rounds), the tamper guard, the Nebius checkpoint and overlay logic, git review branches, patch output and line endings.
 
 ## Project layout
 

@@ -278,6 +278,36 @@ def _repo_hash(files: dict[str, Path]) -> str:
     return h.hexdigest()
 
 
+SANDBOX_RETRIES = int(os.getenv("SANDBOX_RETRIES", "3"))
+_sleep = time.sleep  # tests replace this
+
+
+def _is_transient(e: Exception) -> bool:
+    """Network hiccups talking to the Nebius Sandboxes API (connect/read timeouts, dropped
+    connections, 502/503/504). Worth retrying; anything else is a real error."""
+    name, text = type(e).__name__, str(e).lower()
+    return (any(k in name for k in ("Timeout", "Connect", "Connection", "RemoteProtocol"))
+            or any(k in text for k in ("timeout", "timed out", "connection reset", " 502", " 503", " 504")))
+
+
+def with_retry(fn, what: str):
+    """Call fn(); on a transient sandbox error wait 2s, 4s, ... and try again."""
+    for attempt in range(1, SANDBOX_RETRIES + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if not _is_transient(e) or attempt == SANDBOX_RETRIES:
+                raise
+            wait = 2 ** attempt
+            log(f"[sandbox] {what}: {type(e).__name__}, retrying in {wait}s "
+                f"(attempt {attempt + 1}/{SANDBOX_RETRIES})")
+            _sleep(wait)
+
+
+class SandboxUnavailable(RuntimeError):
+    pass
+
+
 def _base_checkpoint(repo_dir: str):
     """Nebius checkpoint = base image + pytest + the repo (+ its requirements.txt).
     Built once per repo state; every branch forks from it (native sandbox branching)."""
@@ -290,12 +320,22 @@ def _base_checkpoint(repo_dir: str):
     with lock:  # branches asking at the same time wait for one build
         if key in _base_cache:
             return _base_cache[key]
-        img = _contree_client().images.use(os.getenv("SANDBOX_IMAGE", "python:3.12-slim"))
-        img = img.run(shell="pip install -q pytest", disposable=False).wait()
-        img = img.apply_files({f"{APP[1:]}/{rel}": str(p) for rel, p in files.items()})
-        if "requirements.txt" in files:
-            img = img.run(shell=f"cd {APP} && pip install -q -r requirements.txt",
-                          disposable=False).wait()
+        def build():
+            img = _contree_client().images.use(os.getenv("SANDBOX_IMAGE", "python:3.12-slim"))
+            img = img.run(shell="pip install -q pytest", disposable=False).wait()
+            img = img.apply_files({f"{APP[1:]}/{rel}": str(p) for rel, p in files.items()})
+            if "requirements.txt" in files:
+                img = img.run(shell=f"cd {APP} && pip install -q -r requirements.txt",
+                              disposable=False).wait()
+            return img
+        try:
+            img = with_retry(build, "building repo checkpoint")
+        except Exception as e:
+            if _is_transient(e):
+                raise SandboxUnavailable(
+                    f"Can't reach Nebius Sandboxes ({type(e).__name__}) after {SANDBOX_RETRIES} tries. "
+                    "Check your internet connection, then run: python scripts/hello_sandbox.py") from e
+            raise
         log(f"[sandbox] Nebius checkpoint ready for {Path(repo_dir).name} ({img.uuid})")
         with _cache_lock:
             _base_cache[key] = img
@@ -340,8 +380,9 @@ def run_in_sandbox(workdir: str, command: str, timeout: int = 120) -> tuple[int,
     deleted = _deleted_files(origin, workdir)
     rm = f"rm -f -- {' '.join(shlex.quote(d) for d in deleted)} && " if deleted else ""
     shell = f"cd {APP} && {rm}PYTHONDONTWRITEBYTECODE=1 timeout {timeout} sh -c {shlex.quote(command)}"
-    r = base.run(shell=shell, files=_changed_files(origin, workdir) or None,
-                 timeout=timeout + 60).wait()
+    overlay = _changed_files(origin, workdir) or None
+    r = with_retry(lambda: base.run(shell=shell, files=overlay, timeout=timeout + 60).wait(),
+                   "running command")
     out = (r.stdout or "") + (r.stderr or "")
     if r.exit_code == 124:
         out += f"\nCommand timed out after {timeout}s"
@@ -1348,10 +1389,21 @@ def main():
                     help="Spend cap for this run in USD (default: MAX_USD_PER_RUN or no cap)")
     a = ap.parse_args()
 
-    s = run(a.repo, a.task, a.test_cmd, a.branches, a.rounds, a.max_turns, a.apply,
+    try:
+        s = _run_cli(a)
+    except SandboxUnavailable as e:
+        raise SystemExit(f"\nERROR: {e}")
+    print("\n=== SUMMARY ===")
+    _print_summary(a, s)
+
+
+def _run_cli(a):
+    return run(a.repo, a.task, a.test_cmd, a.branches, a.rounds, a.max_turns, a.apply,
             make_branch=not a.no_branch, first_green=not a.all_branches, thinking=a.thinking,
             max_usd=a.max_usd, ladder=a.ladder)
-    print("\n=== SUMMARY ===")
+
+
+def _print_summary(a, s):
     g = s.get("git") or {}
     if g.get("branch"):
         print(f"Fix committed to branch {g['branch']} ({g['commit']}). Review with:")
