@@ -142,6 +142,8 @@ def get_client():
 
 
 EXECUTOR_MAX_TOKENS = int(os.getenv("EXECUTOR_MAX_TOKENS", "8192"))
+STALL_LIMIT = int(os.getenv("EXECUTOR_STALL_LIMIT", "3"))   # edits in a row without more tests passing
+IDLE_LIMIT = int(os.getenv("EXECUTOR_IDLE_LIMIT", "6"))     # turns in a row without any edit
 _thinking_unsupported = False
 
 
@@ -323,7 +325,10 @@ def run_in_sandbox(workdir: str, command: str, timeout: int = 120) -> tuple[int,
     SANDBOX=local: runs on this machine. Only for tests and trusted demo repos."""
     if os.getenv("SANDBOX", "nebius").lower() == "local":
         try:
-            p = subprocess.run(command, shell=True, cwd=workdir, capture_output=True,
+            # No .pyc files: two quick edits of the same size within one second would otherwise
+            # run stale bytecode and report the old result.
+            env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+            p = subprocess.run(command, shell=True, cwd=workdir, capture_output=True, env=env,
                                text=True, encoding="utf-8", errors="replace", timeout=timeout)
             return p.returncode, (p.stdout or "") + (p.stderr or "")
         except subprocess.TimeoutExpired:
@@ -334,7 +339,7 @@ def run_in_sandbox(workdir: str, command: str, timeout: int = 120) -> tuple[int,
     base = _base_checkpoint(origin)
     deleted = _deleted_files(origin, workdir)
     rm = f"rm -f -- {' '.join(shlex.quote(d) for d in deleted)} && " if deleted else ""
-    shell = f"cd {APP} && {rm}timeout {timeout} sh -c {shlex.quote(command)}"
+    shell = f"cd {APP} && {rm}PYTHONDONTWRITEBYTECODE=1 timeout {timeout} sh -c {shlex.quote(command)}"
     r = base.run(shell=shell, files=_changed_files(origin, workdir) or None,
                  timeout=timeout + 60).wait()
     out = (r.stdout or "") + (r.stderr or "")
@@ -366,11 +371,17 @@ def tail(text: str, n: int = 4000) -> str:
 
 
 def safe_path(root: str, rel: str) -> Path:
-    """Resolve rel inside root; refuse anything that escapes the branch folder."""
+    """Resolve rel inside root; refuse anything that escapes the branch folder.
+    Models see /app in sandbox output and often pass /app/pkg/x.py, so that prefix is
+    mapped to the repo root instead of failing turn after turn."""
+    rel = (rel or "").replace("\\", "/").strip()
+    if rel == APP or rel.startswith(APP + "/"):
+        rel = rel[len(APP) + 1:] or "."
     root_p = Path(root).resolve()
     p = (root_p / rel).resolve()
     if p != root_p and root_p not in p.parents:
-        raise ValueError(f"Path escapes workspace: {rel}")
+        raise ValueError(f"Path escapes workspace: {rel}. Use a path relative to the repo root, "
+                         f"e.g. {next(iter(list_files(root)), 'pkg/module.py')}")
     return p
 
 
@@ -527,7 +538,14 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}},
                        "required": ["path"]}}},
     {"type": "function", "function": {
-        "name": "write_file", "description": "Overwrite a file with full new content.",
+        "name": "edit_file",
+        "description": ("Replace one exact snippet in a file. 'old' must appear exactly once, so "
+                        "include a few surrounding lines. Best for small fixes."),
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}},
+            "required": ["path", "old", "new"]}}},
+    {"type": "function", "function": {
+        "name": "write_file", "description": "Create a file or overwrite it with full new content.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"}, "content": {"type": "string"}},
             "required": ["path", "content"]}}},
@@ -548,7 +566,38 @@ def write_preserving_newlines(p: Path, content: str) -> None:
     p.write_bytes(content.encode("utf-8"))
 
 
+TOOL_NAMES = [t["function"]["name"] for t in TOOLS]
+# Names models reach for from other agent frameworks, mapped onto ours
+TOOL_ALIASES = {"str_replace_editor": "edit_file", "str_replace": "edit_file",
+                "replace_in_file": "edit_file", "view": "read_file", "cat": "read_file",
+                "create_file": "write_file", "bash": "run_command", "shell": "run_command"}
+
+
+def _normalize_call(name: str, args: dict) -> tuple[str, dict]:
+    name = TOOL_ALIASES.get(name, name)
+    if name == "edit_file" and args.get("command") in ("view", "read"):
+        name = "read_file"
+    elif name == "edit_file" and args.get("command") == "create":
+        name, args = "write_file", {"path": args.get("path"), "content": args.get("file_text", "")}
+    if name == "edit_file":
+        args = {"path": args.get("path"), "old": args.get("old", args.get("old_str")),
+                "new": args.get("new", args.get("new_str", ""))}
+    if name == "run_command" and "cmd" in args:
+        args = {"command": args["cmd"]}
+    return name, args
+
+
+def _refuse_protected(workdir: str, p: Path, shown: str, protect: bool) -> Optional[str]:
+    if protect and is_protected(p.relative_to(Path(workdir).resolve()).as_posix()):
+        return (f"Refused: {shown} is a test or test-config file and is read-only. "
+                "Fix the source code so the existing tests pass.")
+    return None
+
+
 def run_tool(workdir: str, name: str, args: dict, protect: bool = True) -> str:
+    """Results starting with 'Wrote'/'Edited' mean the code changed (tests auto-run);
+    'No change' means the edit was identical to what's there (counts as no progress)."""
+    name, args = _normalize_call(name, args)
     try:
         if name == "list_files":
             return "\n".join(list_files(workdir)) or "(empty)"
@@ -556,16 +605,39 @@ def run_tool(workdir: str, name: str, args: dict, protect: bool = True) -> str:
             return tail(safe_path(workdir, args["path"]).read_text(encoding="utf-8"), 20000)
         if name == "write_file":
             p = safe_path(workdir, args["path"])
-            if protect and is_protected(p.relative_to(Path(workdir).resolve()).as_posix()):
-                return (f"Refused: {args['path']} is a test or test-config file and is read-only. "
-                        "Fix the source code so the existing tests pass.")
+            refused = _refuse_protected(workdir, p, args["path"], protect)
+            if refused:
+                return refused
+            if p.exists() and p.read_bytes().decode("utf-8", "replace").replace("\r\n", "\n") \
+                    == args["content"].replace("\r\n", "\n"):
+                return (f"No change: {args['path']} already has exactly this content. "
+                        "Re-read the failing output and try a different fix.")
             p.parent.mkdir(parents=True, exist_ok=True)
             write_preserving_newlines(p, args["content"])
             return f"Wrote {args['path']} ({len(args['content'])} chars)"
+        if name == "edit_file":
+            p = safe_path(workdir, args["path"])
+            refused = _refuse_protected(workdir, p, args["path"], protect)
+            if refused:
+                return refused
+            old, new = (args.get("old") or "").replace("\r\n", "\n"), (args.get("new") or "").replace("\r\n", "\n")
+            if not old:
+                return "Error: 'old' is empty. Give the exact text to replace, or use write_file."
+            text = p.read_bytes().decode("utf-8").replace("\r\n", "\n")
+            n = text.count(old)
+            if n == 0:
+                return (f"Error: 'old' text not found in {args['path']}. Whitespace must match exactly; "
+                        "read_file to see the current content.")
+            if n > 1:
+                return f"Error: 'old' text appears {n} times in {args['path']}. Include more surrounding lines."
+            if old == new:
+                return f"No change: 'old' and 'new' are identical. Try a different fix."
+            write_preserving_newlines(p, text.replace(old, new, 1))
+            return f"Edited {args['path']} (replaced {old.count(chr(10)) + 1} line(s))"
         if name == "run_command":
             code, out = run_in_sandbox(workdir, args["command"])
             return f"exit code {code}\n{tail(out)}"
-        return f"Unknown tool: {name}"
+        return f"Unknown tool: {name}. Available tools: {', '.join(TOOL_NAMES)}"
     except Exception as e:  # tool errors go back to the model, not up the stack
         return f"Error: {type(e).__name__}: {e}"
 
@@ -632,6 +704,8 @@ Propose exactly {n} DIFFERENT strategies to make the tests pass. Each strategy s
 concrete instruction (1-3 sentences) naming the files/functions to look at and the fix idea.
 Make them genuinely different (different root-cause hypotheses or approaches), not rewordings.
 Base every strategy on the actual code shown; don't guess at bugs you can't see in it.
+Prefer the smallest change that fixes the root cause: edit the buggy lines. Don't add new
+functions, classes or refactors unless a test needs them. Name files by their path from the repo root.
 Never suggest editing or deleting tests to make them pass.
 Reply ONLY with JSON: {{"strategies": ["...", "..."]}}"""
 
@@ -652,7 +726,8 @@ def planner_node(state: GraphState) -> dict:
     model = stage_model("planner")
     msg, (i, o) = chat(model,
                        [{"role": "system", "content": PLANNER_PROMPT.format(n=n)},
-                        {"role": "user", "content": user}])
+                        {"role": "user", "content": user}],
+                       thinking=os.getenv("PLANNER_THINKING") or None)
     usd = budget(state["run_id"]).add(model, i, o)
     data = parse_json(msg.content) or {}
     strategies = [s for s in data.get("strategies", []) if isinstance(s, str) and s.strip()][:n]
@@ -678,6 +753,7 @@ def fan_out(state: GraphState) -> list[Send]:
             "start_dir": state.get("start_dir"),
             "start_output": state.get("start_output") or state["baseline_output"],
             "progress": state.get("progress", ""),
+            "start_passed": state.get("start_passed", 0),
             "strategy": s,
             "task": state["task"],
             "repo_dir": state["repo_dir"],
@@ -695,18 +771,22 @@ def fan_out(state: GraphState) -> list[Send]:
 
 
 EXECUTOR_PROMPT = """You are the executor of an autonomous coding agent. You work inside a copy of a Python repo.
-Tools: list_files, read_file, write_file, run_command. The repo's key files are included below.
-Goal: make the test command pass by fixing the source code. Keep changes minimal.
-Follow the strategy you are given.
+Tools: list_files, read_file, edit_file, write_file, run_command. The repo's key files are included below.
+Goal: make the test command pass by fixing the source code. Keep changes minimal: fix the buggy
+lines, don't refactor. Follow the strategy you are given.
 
 RULES:
+- Paths are relative to the repo root, e.g. pkg/module.py (not /app/pkg/module.py).
 - Test files and test config (test_*.py, conftest.py, pytest.ini, pyproject.toml, tests/) are
   read-only. Writes to them are refused, and they are restored before the final check.
-- Make EVERY edit with write_file, passing the complete new file content.
+- Make EVERY edit with edit_file (replace one exact snippet; best for small fixes) or
+  write_file (complete new file content).
 - NEVER edit files with shell commands (sed, echo >, cat <<EOF, python -c, pip install).
   Each command runs in a fresh sandbox, so those changes are thrown away.
-- After each write_file, the tests run automatically and you'll see the result.
+- After each edit, the tests run automatically and you'll see the result.
   You don't need to run them yourself.
+- If an edit doesn't increase the number of passing tests, don't repeat it: re-read the
+  failing output and change your approach. Branches that stop making progress are ended.
 When the tests pass (or you cannot make progress), reply with a short summary and no tool calls."""
 
 
@@ -744,6 +824,11 @@ def executor_node(payload: dict) -> dict:
     model = payload.get("model") or stage_model("executor")
     tin = tout = turns = tool_calls = refused = 0
     usd = 0.0
+    # Stuck detection: real runs showed Nano rewriting the same file 10 times with the same
+    # result, or failing on paths for 12 turns. Both burn tokens, so end the branch early.
+    best_passed = payload.get("start_passed", 0)
+    stall = idle = 0                 # edits without progress / turns without any edit
+    nudged = False
     tampered: set[str] = set()
     verified = None          # (code, output) once the judge has seen the tests pass
     stop = "gave up"
@@ -782,7 +867,7 @@ def executor_node(payload: dict) -> dict:
                             "function": {"name": c.function.name, "arguments": c.function.arguments}}
                            for c in calls],
         })
-        wrote = False
+        wrote = noop = False
         for c in calls:
             tool_calls += 1
             try:
@@ -796,8 +881,10 @@ def executor_node(payload: dict) -> dict:
             messages.append({"role": "tool", "tool_call_id": c.id, "content": result})
             if result.startswith("Refused:"):
                 refused += 1
-            if c.function.name == "write_file" and result.startswith("Wrote"):
+            if result.startswith(("Wrote", "Edited")):
                 wrote = True
+            elif result.startswith("No change"):
+                noop = True
             # The model's own test runs are information only: they never mark a branch green
             # (e.g. "pytest -q || true" exits 0). Only judge() can do that.
 
@@ -807,17 +894,37 @@ def executor_node(payload: dict) -> dict:
                 tampered.update(t)
             except Exception as e:
                 code, out = 1, f"Sandbox error: {type(e).__name__}: {e}"
+            n_pass = pytest_counts(out).get("passed", 0)
             if code == 0:
                 verified = (0, out)
             else:
                 messages.append({"role": "user", "content":
                                  f"[auto test run after your edit] exit code {code}\n{tail(out, 1500)}"})
-            log(f"[{bid}] turn {turns}: auto test -> {'GREEN' if code == 0 else f'exit {code}'}")
+            log(f"[{bid}] turn {turns}: auto test -> {'GREEN' if code == 0 else f'exit {code}'}"
+                + (f" ({n_pass} passing)" if not verified else ""))
         if verified:
             stop = "tests passed"
             if first_green:
                 cancel.set()
             break
+
+        if wrote and n_pass > best_passed:
+            best_passed, stall, idle, nudged = n_pass, 0, 0, False
+        elif wrote or noop:
+            stall, idle = stall + 1, 0
+        else:
+            idle += 1
+        if stall >= STALL_LIMIT or idle >= IDLE_LIMIT:
+            stop = "stuck"
+            log(f"[{bid}] turn {turns}: no progress ({stall} edits without gain, {idle} turns without "
+                "edits), ending branch")
+            break
+        if (stall >= STALL_LIMIT - 1 or idle >= IDLE_LIMIT - 2) and not nudged:
+            nudged = True
+            messages.append({"role": "user", "content": (
+                "[no progress] Your recent turns haven't increased the number of passing tests. "
+                "Stop repeating the same change. Re-read the failing assertion, find which function "
+                "produces the wrong value, and fix that. This branch ends soon without progress.")})
 
     cancelled = stop == "cancelled"
     if verified:
@@ -976,7 +1083,8 @@ def reflector_node(state: GraphState) -> dict:
     model = stage_model("reflector")
     msg, (i, o) = chat(model,
                        [{"role": "system", "content": REFLECTOR_PROMPT},
-                        {"role": "user", "content": f"Task: {state['task']}\n\n{text}"}])
+                        {"role": "user", "content": f"Task: {state['task']}\n\n{text}"}],
+                       thinking=os.getenv("REFLECTOR_THINKING") or None)
     usd = budget(state["run_id"]).add(model, i, o)
     log(f"[reflector] {(msg.content or '').strip()[:200]}")
     return {"feedback": msg.content or "",

@@ -24,7 +24,7 @@ Point Fork at a repo with failing tests. It:
 
 1. **Plans.** NVIDIA Nemotron 3 Ultra reads the code and the failing output and proposes *N genuinely different* fix strategies.
 2. **Forks.** The repo is uploaded once as a Nebius sandbox checkpoint. Every strategy gets its own branch that forks from that checkpoint, so branches run in parallel and never see each other's edits.
-3. **Executes.** In each branch, Nemotron 3 Nano edits files and the tests re-run automatically after every edit, in the sandbox.
+3. **Executes.** In each branch, Nemotron 3 Nano edits files (snippet edits or whole files) and the tests re-run automatically after every edit, in the sandbox. A branch that stops making progress (repeating the same edit, or not editing at all) gets one nudge, then is ended so it stops spending tokens.
 4. **Judges.** A branch is green only when the *original, untouched* tests pass (see [tamper guard](#tamper-guard)). The first green branch cancels the others.
 5. **Merges partial fixes.** If no branch is green but several fixed *different* bugs in *different* files, their changes are combined and judged, with no extra model calls. Often that alone turns the suite green.
 6. **Escalates.** Otherwise Nemotron 3 Ultra explains what went wrong, and the next round starts from the best partial fix so far (not from scratch) on a bigger model: Nano, then Super, then Ultra.
@@ -53,7 +53,7 @@ Built as a [LangGraph](https://github.com/langchain-ai/langgraph) `StateGraph`. 
 |---|---|
 | Graph, nodes, sandbox, tamper guard, cost tracking | `agent_graph.py` |
 | Streamlit UI: run, watch live, compare branches, approve or reject | `graph_app.py` |
-| Offline test suite (fake LLM, fake sandbox, 44 tests) | `test_agent_graph.py` |
+| Offline test suite (fake LLM, fake sandbox, 53 tests) | `test_agent_graph.py` |
 | Demo repos with planted bugs: `invoice` (3 bugs, 2 files), `bookstore` (7 bugs, 5 modules) | `examples/` |
 
 ## How NVIDIA Nemotron and Nebius are used
@@ -69,6 +69,17 @@ Built as a [LangGraph](https://github.com/langchain-ai/langgraph) `StateGraph`. 
 | **Nebius Token Factory Sandboxes** (`contree-sdk`) | Every test and command runs in an isolated cloud sandbox | The repo becomes one checkpoint and each branch overlays only its changed files, so parallel branches are cheap and isolated |
 
 Every run reports tokens and **USD cost per stage**, and you can cap spend per run (`--max-usd`).
+
+## Results on Nebius
+
+Real runs with Nemotron 3 on Token Factory and Nebius Sandboxes, 3 parallel branches:
+
+| Demo | Bugs | Result | What happened | Cost |
+|---|---|---|---|---|
+| `invoice` | 3 bugs, 2 files | green in 1 round | Ultra planned 3 strategies, a Nano branch fixed both files in 5 turns | $0.011 |
+| `bookstore` | 7 bugs, 5 modules | green in 2 rounds | Round 1 on Nano: best branch reached 17/18 tests. Round 2 started from that partial fix on Super and finished in 2 turns. One Nano branch tried to edit `tests/test_orders.py`; the tamper guard refused it | $0.056 |
+
+The bookstore logs also showed Nano repeating an identical edit ten times and fighting absolute `/app/...` paths; the stuck-branch detection, path mapping and snippet-edit tool were added in response.
 
 ## Tamper guard
 
@@ -143,7 +154,8 @@ All settings live in `.env` (see `.env.example`). The important ones:
 | `NEBIUS_API_KEY`, `NEBIUS_PROJECT_ID` | – | Token Factory key and project (the project is needed for sandboxes) |
 | `PLANNER_MODEL`, `EXECUTOR_MODEL`, `REFLECTOR_MODEL` | `NEBIUS_MODEL` | Model per stage (aliases `nano`, `super`, `ultra` work) |
 | `EXECUTOR_LADDER` | – | Executor model per round; overrides `EXECUTOR_MODEL` |
-| `EXECUTOR_THINKING` | model default | `on`, `low` or `off` |
+| `EXECUTOR_THINKING`, `PLANNER_THINKING`, `REFLECTOR_THINKING` | model default | `on`, `low` or `off` per stage |
+| `EXECUTOR_STALL_LIMIT`, `EXECUTOR_IDLE_LIMIT` | 3, 6 | End a branch after this many edits without progress / turns without edits |
 | `SANDBOX` | `nebius` | `local` runs commands on your machine. Only for tests and trusted repos; hidden in the UI unless `ALLOW_LOCAL_SANDBOX=1` |
 | `SANDBOX_IMAGE` | `python:3.12-slim` | Base image for the sandbox checkpoint |
 | `MAX_USD_PER_RUN` | no cap | Default spend cap |
@@ -155,7 +167,7 @@ All settings live in `.env` (see `.env.example`). The important ones:
 python -m pytest -q
 ```
 
-44 tests. They script the model's replies and fake the Nebius sandbox, so they need **no API key, no network and no credits**, and they run in CI on every push. They cover the graph (branching, reflection, first-green cancellation, budget cap, escalation, partial-fix merging, carrying progress between rounds), the tamper guard, the Nebius checkpoint and overlay logic, git review branches, patch output and line endings.
+53 tests. They script the model's replies and fake the Nebius sandbox, so they need **no API key, no network and no credits**, and they run in CI on every push. They cover the graph (branching, reflection, first-green cancellation, budget cap, escalation, partial-fix merging, carrying progress between rounds), the tamper guard, the Nebius checkpoint and overlay logic, git review branches, patch output and line endings.
 
 ## Project layout
 
@@ -179,6 +191,7 @@ python -m pytest -q
 - [x] Tamper guard, USD cost tracking and spend cap, trajectory logging, CI
 - [x] Model escalation (Nano, then Super, then Ultra), partial-fix merging, rounds build on the best partial fix
 - [x] Harder multi-file demo repo (`examples/bookstore`)
+- [x] Tuned from real runs: snippet edit tool, stuck-branch detection, `/app` path mapping, tool-name aliases, minimal-change planning
 - [ ] Benchmark on SWE-rebench
 - [ ] Build mode: prompt, then tests, then code
 - [ ] Fine-tuned Nemotron executor from collected trajectories

@@ -17,7 +17,8 @@ TEST = "from calc import add\n\ndef test_add():\n    assert add(2, 3) == 5\n"
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     """Your real .env must not change test results (models, spend caps, prices)."""
-    for k in ("MAX_USD_PER_RUN", "PRICES_JSON", "EXECUTOR_THINKING", "PLANNER_MODEL",
+    for k in ("MAX_USD_PER_RUN", "PRICES_JSON", "EXECUTOR_THINKING", "PLANNER_THINKING",
+              "REFLECTOR_THINKING", "EXECUTOR_LADDER", "PLANNER_MODEL",
               "EXECUTOR_MODEL", "REFLECTOR_MODEL", "ALLOW_LOCAL_SANDBOX"):
         monkeypatch.delenv(k, raising=False)
 
@@ -672,3 +673,97 @@ def test_next_round_builds_on_best_partial_fix(two_bug_repo, tmp_path, monkeypat
     assert sorted(w["changed"]) == ["a.py", "b.py"]
     assert "Progress so far" in prompts[1] and "r1_b0" in prompts[1]
     assert (two_bug_repo / "a.py").read_text() == A_BUG                    # original untouched
+
+
+# --- Stage 2.5: lessons from the first real Nemotron runs ---------------------------
+
+def test_app_prefixed_paths_map_to_repo_root(tmp_path):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "cart.py").write_text("x = 1\n")
+    assert ag.run_tool(str(tmp_path), "read_file", {"path": "/app/pkg/cart.py"}) == "x = 1\n"
+    err = ag.run_tool(str(tmp_path), "read_file", {"path": "/etc/passwd"})
+    assert err.startswith("Error") and "relative to the repo root" in err
+
+
+def test_edit_file_replaces_one_snippet(tmp_path):
+    (tmp_path / "calc.py").write_bytes(BUGGY.replace("\n", "\r\n").encode())
+    r = ag.run_tool(str(tmp_path), "edit_file", {"path": "calc.py", "old": "a - b", "new": "a + b"})
+    assert r.startswith("Edited")
+    assert (tmp_path / "calc.py").read_bytes() == FIXED.replace("\n", "\r\n").encode()   # CRLF kept
+
+
+def test_edit_file_errors_are_helpful(tmp_path):
+    (tmp_path / "m.py").write_text("x = 1\nx = 1\n")
+    assert "not found" in ag.run_tool(str(tmp_path), "edit_file", {"path": "m.py", "old": "y", "new": "z"})
+    assert "2 times" in ag.run_tool(str(tmp_path), "edit_file", {"path": "m.py", "old": "x = 1", "new": "x = 2"})
+    assert ag.run_tool(str(tmp_path), "edit_file",
+                       {"path": "test_m.py", "old": "a", "new": "b"}).startswith("Refused")
+
+
+def test_tool_aliases_from_other_frameworks(tmp_path):
+    (tmp_path / "calc.py").write_text(BUGGY)
+    r = ag.run_tool(str(tmp_path), "str_replace_editor",
+                    {"command": "str_replace", "path": "/app/calc.py", "old_str": "a - b", "new_str": "a + b"})
+    assert r.startswith("Edited") and (tmp_path / "calc.py").read_text() == FIXED
+    assert ag.run_tool(str(tmp_path), "str_replace_editor", {"command": "view", "path": "calc.py"}) == FIXED
+    assert "Available tools" in ag.run_tool(str(tmp_path), "teleport", {})
+
+
+def test_identical_write_is_reported_as_no_change(tmp_path):
+    (tmp_path / "calc.py").write_text(BUGGY)
+    assert ag.run_tool(str(tmp_path), "write_file", {"path": "calc.py", "content": BUGGY}).startswith("No change")
+
+
+def test_branch_that_stops_improving_is_ended(repo, tmp_path, monkeypatch):
+    wrong = iter(f"def add(a, b):\n    return a * b + {k}\n" for k in range(100))
+    def fake(model, messages, tools=None, **kw):
+        if "planner" in messages[0]["content"]:
+            return msg(json.dumps({"strategies": ["s"]})), (1, 1)
+        return msg("", [call("write_file", path="calc.py", content=next(wrong))]), (1, 1)
+    monkeypatch.setattr(ag, "chat", fake)
+    s = ag.run(str(repo), "fix", branches=1, rounds=1, max_turns=15, work_root=str(tmp_path / "b"),
+               make_branch=False, full=True)
+    r = s["results"][0]
+    assert r["stop_reason"] == "stuck" and r["turns"] == ag.STALL_LIMIT
+    assert any("[no progress]" in m["content"] for m in r["messages"] if m["role"] == "user")
+
+
+def test_branch_that_never_edits_is_ended(repo, tmp_path, monkeypatch):
+    def fake(model, messages, tools=None, **kw):
+        if "planner" in messages[0]["content"]:
+            return msg(json.dumps({"strategies": ["s"]})), (1, 1)
+        return msg("", [call("list_files")]), (1, 1)
+    monkeypatch.setattr(ag, "chat", fake)
+    s = ag.run(str(repo), "fix", branches=1, rounds=1, max_turns=15, work_root=str(tmp_path / "b"),
+               make_branch=False, full=True)
+    r = s["results"][0]
+    assert r["stop_reason"] == "stuck" and r["turns"] == ag.IDLE_LIMIT
+
+
+def test_progress_resets_the_stall_counter(two_bug_repo, tmp_path, monkeypatch):
+    """Two edits without gain, then real progress, then two more: never hits the limit of 3."""
+    edits = iter([("a.py", "def fa():\n    return 5\n"), ("a.py", "def fa():\n    return 6\n"),
+                  ("a.py", A_FIX), ("b.py", "def fb():\n    return 7\n"),
+                  ("b.py", "def fb():\n    return 8\n"), ("b.py", B_FIX)])
+    def fake(model, messages, tools=None, **kw):
+        if "planner" in messages[0]["content"]:
+            return msg(json.dumps({"strategies": ["s"]})), (1, 1)
+        path, content = next(edits)
+        return msg("", [call("write_file", path=path, content=content)]), (1, 1)
+    monkeypatch.setattr(ag, "chat", fake)
+    s = ag.run(str(two_bug_repo), "fix", branches=1, rounds=1, max_turns=10,
+               work_root=str(tmp_path / "b"), make_branch=False)
+    assert s["status"] == "green"
+
+
+def test_planner_thinking_setting_is_passed(repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("PLANNER_THINKING", "low")
+    seen = {}
+    def fake(model, messages, tools=None, **kw):
+        if "planner" in messages[0]["content"]:
+            seen["thinking"] = kw.get("thinking")
+            return msg(json.dumps({"strategies": ["GOOD fix"]})), (1, 1)
+        return msg("", [call("write_file", path="calc.py", content=FIXED)]), (1, 1)
+    monkeypatch.setattr(ag, "chat", fake)
+    ag.run(str(repo), "fix", branches=1, rounds=1, work_root=str(tmp_path / "b"), make_branch=False)
+    assert seen["thinking"] == "low"
