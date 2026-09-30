@@ -96,7 +96,10 @@ with st.sidebar:
     task = st.text_area("Task", "Make the failing tests pass without changing the tests.", height=90)
     test_cmd = st.text_input("Test command", "pytest -q")
     branches = st.slider("Parallel branches", 1, 5, 3)
-    rounds = st.slider("Max rounds", 1, 3, 2)
+    rounds = st.slider("Max rounds", 1, 4, 3)
+    ladder = st.text_input("Executor model per round", os.getenv("EXECUTOR_LADDER", "nano,super,ultra"),
+                           help="Escalation: round 1 uses the first model, round 2 the second, and so on. "
+                                "Aliases: nano, super, ultra. Leave empty to use EXECUTOR_MODEL every round.")
     max_turns = st.slider("Max turns per branch", 3, 20, 10)
     first_green = st.checkbox("Stop at first green branch", value=True,
                               help="Faster and cheaper. Untick to let every branch finish and compare diffs.")
@@ -129,7 +132,8 @@ sandbox_problem = ag.sandbox_ready()
 
 st.title("🍴 Fork: Red to Green")
 st.write("Give it a repo with failing tests. It tries several fixes in parallel, picks the smallest "
-         "one that turns the tests green, and asks you before anything changes.")
+         "one that turns the tests green, and asks you before anything changes. If no single fix works, "
+         "it merges partial fixes, and the next round starts from the best one on a bigger model.")
 
 if not repo_ok:
     st.error(f"Folder not found: {repo_dir}")
@@ -160,7 +164,8 @@ if st.button("Run agent", type="primary", disabled=running):
     ss.job, ss.decision = job, None
     kwargs = dict(repo=repo_dir, task=task, test_cmd=test_cmd, branches=branches,
                   rounds=rounds, max_turns=max_turns, first_green=first_green,
-                  thinking=None if thinking == "on" else thinking, max_usd=max_usd or None)
+                  thinking=None if thinking == "on" else thinking, max_usd=max_usd or None,
+                  ladder=ladder)
     threading.Thread(target=worker, args=(job, kwargs), daemon=True).start()
     running = True
 

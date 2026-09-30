@@ -569,3 +569,106 @@ def test_saved_winner_patch_is_byte_exact(repo, tmp_path, monkeypatch):
     # A CRLF repo (write_text on Windows) legitimately gives CRLF lines; what must never
     # happen is text-mode writing adding a second \r (\r\r\n) or \r to LF lines.
     assert saved == s["winner"]["patch"].encode() and b"\r\r\n" not in saved
+
+
+# --- Stage 2: escalation, partial-fix merging, progress carry-over -------------------
+
+def test_parse_ladder_resolves_aliases():
+    assert ag.parse_ladder("nano, Super,ultra") == [ag.MODEL_ALIASES["nano"], ag.MODEL_ALIASES["super"],
+                                                     ag.MODEL_ALIASES["ultra"]]
+    assert ag.parse_ladder("my/model") == ["my/model"] and ag.parse_ladder("") == []
+
+
+def test_ladder_escalates_executor_model_each_round(repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("PROVIDER", "nebius")
+    seen = []
+    def fake(model, messages, tools=None, **kw):
+        if "planner" in messages[0]["content"]:
+            return msg(json.dumps({"strategies": ["bad"]})), (1, 1)
+        if "reflector" in messages[0]["content"]:
+            return msg("try harder"), (1, 1)
+        seen.append(model)
+        if any(m["role"] == "assistant" for m in messages):
+            return msg("done"), (1, 1)
+        return msg("", [call("write_file", path="calc.py", content=WRONG)]), (1, 1)
+    monkeypatch.setattr(ag, "chat", fake)
+    s = ag.run(str(repo), "fix", branches=1, rounds=3, ladder="nano,super",
+               work_root=str(tmp_path / "b"), make_branch=False, full=True)
+    by_round = {r["round"]: r["model"] for r in s["results"]}
+    assert by_round == {1: ag.MODEL_ALIASES["nano"], 2: ag.MODEL_ALIASES["super"],
+                        3: ag.MODEL_ALIASES["super"]}                  # last rung repeats
+    assert set(seen) == {ag.MODEL_ALIASES["nano"], ag.MODEL_ALIASES["super"]}
+
+
+A_BUG, A_FIX = "def fa():\n    return 0\n", "def fa():\n    return 1\n"
+B_BUG, B_FIX = "def fb():\n    return 0\n", "def fb():\n    return 1\n"
+
+
+@pytest.fixture
+def two_bug_repo(tmp_path, monkeypatch):
+    monkeypatch.setenv("SANDBOX", "local")
+    monkeypatch.setattr(ag, "BASE_DIR", tmp_path)
+    r = tmp_path / "two"
+    r.mkdir()
+    (r / "a.py").write_text(A_BUG); (r / "b.py").write_text(B_BUG)
+    (r / "test_a.py").write_text("from a import fa\n\ndef test_a():\n    assert fa() == 1\n")
+    (r / "test_b.py").write_text("from b import fb\n\ndef test_b():\n    assert fb() == 1\n")
+    return r
+
+
+def keyword_chat(plans, planner_prompts=None):
+    """Strategy keywords decide the edit: FIX_A fixes a.py, FIX_B fixes b.py, BAD breaks a.py."""
+    state = {"planner": 0}
+    lock = threading.Lock()
+    def fake(model, messages, tools=None, **kw):
+        system = messages[0]["content"]
+        if "planner" in system:
+            with lock:
+                if planner_prompts is not None:
+                    planner_prompts.append(messages[1]["content"])
+                strategies = plans[min(state["planner"], len(plans) - 1)]
+                state["planner"] += 1
+            return msg(json.dumps({"strategies": strategies})), (1, 1)
+        if "reflector" in system:
+            return msg("partial progress"), (1, 1)
+        if any(m["role"] == "assistant" for m in messages):
+            return msg("done"), (1, 1)
+        task = messages[1]["content"].split("Repo files:")[0]
+        if "FIX_A" in task:
+            return msg("", [call("write_file", path="a.py", content=A_FIX)]), (1, 1)
+        if "FIX_B" in task:
+            return msg("", [call("write_file", path="b.py", content=B_FIX)]), (1, 1)
+        return msg("", [call("write_file", path="a.py", content="def fa():\n    return 2\n")]), (1, 1)
+    return fake
+
+
+def test_partial_fixes_from_two_branches_are_merged(two_bug_repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(ag, "chat", keyword_chat([["FIX_A only", "FIX_B only", "BAD"]]))
+    s = ag.run(str(two_bug_repo), "fix", branches=3, rounds=2, work_root=str(tmp_path / "b"),
+               make_branch=False, full=True)
+    w = s["winner"]
+    assert s["summary"]["status"] == "green" and s["summary"]["rounds"] == 1   # no second round needed
+    assert w["branch_id"] == "r1_merge" and sorted(w["changed"]) == ["a.py", "b.py"]
+    assert "r1_b0" in w["strategy"] and "r1_b1" in w["strategy"] and "r1_b2" not in w["strategy"]
+
+
+def test_merge_skips_a_branch_that_makes_things_worse(two_bug_repo, tmp_path, monkeypatch):
+    """BAD edits a.py, which FIX_A already owns, so it's never merged in."""
+    monkeypatch.setattr(ag, "chat", keyword_chat([["FIX_A only", "BAD"]]))
+    s = ag.run(str(two_bug_repo), "fix", branches=2, rounds=1, work_root=str(tmp_path / "b"),
+               make_branch=False, full=True)
+    assert s["summary"]["status"] == "red"
+    assert not any(r["branch_id"].endswith("merge") for r in s["results"])   # only one real candidate
+
+
+def test_next_round_builds_on_best_partial_fix(two_bug_repo, tmp_path, monkeypatch):
+    prompts = []
+    monkeypatch.setattr(ag, "chat", keyword_chat([["FIX_A only", "BAD"], ["FIX_B only"]], prompts))
+    s = ag.run(str(two_bug_repo), "fix", branches=2, rounds=2, work_root=str(tmp_path / "b"),
+               make_branch=False, full=True)
+    w = s["winner"]
+    # round 2 only touched b.py, but it started from r1_b0's copy, so a.py's fix is included
+    assert s["summary"]["status"] == "green" and w["branch_id"] == "r2_b0"
+    assert sorted(w["changed"]) == ["a.py", "b.py"]
+    assert "Progress so far" in prompts[1] and "r1_b0" in prompts[1]
+    assert (two_bug_repo / "a.py").read_text() == A_BUG                    # original untouched

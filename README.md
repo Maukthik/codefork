@@ -26,8 +26,9 @@ Point Fork at a repo with failing tests. It:
 2. **Forks.** The repo is uploaded once as a Nebius sandbox checkpoint. Every strategy gets its own branch that forks from that checkpoint, so branches run in parallel and never see each other's edits.
 3. **Executes.** In each branch, Nemotron 3 Nano edits files and the tests re-run automatically after every edit, in the sandbox.
 4. **Judges.** A branch is green only when the *original, untouched* tests pass (see [tamper guard](#tamper-guard)). The first green branch cancels the others.
-5. **Reflects.** If no branch is green, Nemotron 3 Ultra explains what went wrong and the next round plans with that feedback.
-6. **Hands you a review branch.** The smallest passing diff is committed to `fork/fix-<run>` in your repo using a temporary git worktree. Your checkout is never touched until you approve.
+5. **Merges partial fixes.** If no branch is green but several fixed *different* bugs in *different* files, their changes are combined and judged, with no extra model calls. Often that alone turns the suite green.
+6. **Escalates.** Otherwise Nemotron 3 Ultra explains what went wrong, and the next round starts from the best partial fix so far (not from scratch) on a bigger model: Nano, then Super, then Ultra.
+7. **Hands you a review branch.** The smallest passing diff is committed to `fork/fix-<run>` in your repo using a temporary git worktree. Your checkout is never touched until you approve.
 
 A real run on the included invoice demo: 3 parallel branches, all green, 10-line winning diff across 2 files, about 57k tokens, **about one US cent**.
 
@@ -40,9 +41,10 @@ flowchart LR
     P -->|N strategies| E1[Executor b0<br/>Nemotron 3 Nano]
     P --> E2[Executor b1]
     P --> E3[Executor b2]
-    E1 & E2 & E3 --> S[Selector<br/>smallest green diff]
+    E1 & E2 & E3 --> S[Selector<br/>smallest green diff,<br/>else merge partial fixes]
     S -->|winner| F[Finalize<br/>review branch + patch + trajectories]
-    S -->|none green, rounds left| R[Reflector<br/>Nemotron 3 Ultra] --> P
+    S -->|none green, rounds left:<br/>keep best partial fix| R[Reflector<br/>Nemotron 3 Ultra] --> P
+    P -.->|next round on a bigger model:<br/>Nano, Super, Ultra| E1
 ```
 
 Built as a [LangGraph](https://github.com/langchain-ai/langgraph) `StateGraph`. The parallel fan-out uses `Send`, one per strategy.
@@ -51,16 +53,17 @@ Built as a [LangGraph](https://github.com/langchain-ai/langgraph) `StateGraph`. 
 |---|---|
 | Graph, nodes, sandbox, tamper guard, cost tracking | `agent_graph.py` |
 | Streamlit UI: run, watch live, compare branches, approve or reject | `graph_app.py` |
-| Offline test suite (fake LLM, fake sandbox, 38 tests) | `test_agent_graph.py` |
-| Demo repos with planted bugs | `examples/` |
+| Offline test suite (fake LLM, fake sandbox, 44 tests) | `test_agent_graph.py` |
+| Demo repos with planted bugs: `invoice` (3 bugs, 2 files), `bookstore` (7 bugs, 5 modules) | `examples/` |
 
 ## How NVIDIA Nemotron and Nebius are used
 
 | | What | Why |
 |---|---|---|
 | **Nemotron 3 Ultra** (`nvidia/Nemotron-3-Ultra-550b-a55b`) | Planner and reflector | Few calls, needs the best reasoning: root-cause hypotheses and failure analysis |
-| **Nemotron 3 Nano** (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) | Executor (the many edit and test turns) | Fast and cheap, so trying 3 strategies in parallel costs less than one big-model attempt |
-| **Nemotron 3 Super** (`nvidia/nemotron-3-super-120b-a12b`) | Default for any stage without its own model | Middle ground |
+| **Nemotron 3 Nano** (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) | Executor, round 1 (the many edit and test turns) | Fast and cheap, so trying 3 strategies in parallel costs less than one big-model attempt |
+| **Nemotron 3 Super** (`nvidia/nemotron-3-super-120b-a12b`) | Executor, round 2 (escalation) | Only paid for when Nano couldn't finish |
+| **Nemotron 3 Ultra** as executor | Round 3 (escalation) | Last resort for the hardest remaining bugs |
 | **Nemotron reasoning switch** | `chat_template_kwargs` `enable_thinking` / `low_effort` | Executor runs with thinking `off` or `low` for speed; falls back cleanly if unsupported |
 | **Nebius Token Factory** | OpenAI-compatible inference for every model call | One endpoint for all three Nemotron sizes |
 | **Nebius Token Factory Sandboxes** (`contree-sdk`) | Every test and command runs in an isolated cloud sandbox | The repo becomes one checkpoint and each branch overlays only its changed files, so parallel branches are cheap and isolated |
@@ -92,7 +95,7 @@ cp .env.example .env                 # Windows: copy .env.example .env
 python scripts/list_models.py        # check your key and the exact Nemotron model ids
 python scripts/hello_sandbox.py      # check the Nebius sandbox works
 
-python scripts/make_demo.py          # creates workspace/invoice (a git repo with 3 planted bugs)
+python scripts/make_demo.py          # creates workspace/invoice (3 bugs) and workspace/bookstore (7 bugs)
 ```
 
 **Web UI**
@@ -105,6 +108,7 @@ streamlit run graph_app.py
 
 ```bash
 python agent_graph.py --repo workspace/invoice --branches 3 --rounds 2 --max-usd 0.25
+python agent_graph.py --repo workspace/bookstore --branches 3 --rounds 3 --ladder nano,super,ultra --max-usd 0.50
 git -C workspace/invoice diff main fork/fix-<run_id>     # review
 git -C workspace/invoice merge fork/fix-<run_id>         # accept
 ```
@@ -113,6 +117,7 @@ git -C workspace/invoice merge fork/fix-<run_id>         # accept
 |---|---|---|
 | `--branches` | 3 | Parallel strategies per round |
 | `--rounds` | 2 | Plan, execute, reflect cycles |
+| `--ladder` | `EXECUTOR_LADDER` | Executor model per round, e.g. `nano,super,ultra` |
 | `--max-turns` | 15 | Model turns per branch |
 | `--thinking` | model default | Executor reasoning: `on`, `low`, `off` |
 | `--all-branches` | off | Let every branch finish instead of stopping at the first green one |
@@ -136,7 +141,8 @@ All settings live in `.env` (see `.env.example`). The important ones:
 | Variable | Default | |
 |---|---|---|
 | `NEBIUS_API_KEY`, `NEBIUS_PROJECT_ID` | – | Token Factory key and project (the project is needed for sandboxes) |
-| `PLANNER_MODEL`, `EXECUTOR_MODEL`, `REFLECTOR_MODEL` | `NEBIUS_MODEL` | Model per stage |
+| `PLANNER_MODEL`, `EXECUTOR_MODEL`, `REFLECTOR_MODEL` | `NEBIUS_MODEL` | Model per stage (aliases `nano`, `super`, `ultra` work) |
+| `EXECUTOR_LADDER` | – | Executor model per round; overrides `EXECUTOR_MODEL` |
 | `EXECUTOR_THINKING` | model default | `on`, `low` or `off` |
 | `SANDBOX` | `nebius` | `local` runs commands on your machine. Only for tests and trusted repos; hidden in the UI unless `ALLOW_LOCAL_SANDBOX=1` |
 | `SANDBOX_IMAGE` | `python:3.12-slim` | Base image for the sandbox checkpoint |
@@ -149,7 +155,7 @@ All settings live in `.env` (see `.env.example`). The important ones:
 python -m pytest -q
 ```
 
-38 tests. They script the model's replies and fake the Nebius sandbox, so they need **no API key, no network and no credits**, and they run in CI on every push. They cover the graph (branching, reflection, first-green cancellation, budget cap), the tamper guard, the Nebius checkpoint and overlay logic, git review branches, patch output and line endings.
+44 tests. They script the model's replies and fake the Nebius sandbox, so they need **no API key, no network and no credits**, and they run in CI on every push. They cover the graph (branching, reflection, first-green cancellation, budget cap, escalation, partial-fix merging, carrying progress between rounds), the tamper guard, the Nebius checkpoint and overlay logic, git review branches, patch output and line endings.
 
 ## Project layout
 
@@ -171,8 +177,8 @@ python -m pytest -q
 - [x] Per-stage Nemotron models, reasoning switch, first-green cancellation
 - [x] Review branch via git worktree, Streamlit approve or reject
 - [x] Tamper guard, USD cost tracking and spend cap, trajectory logging, CI
-- [ ] Model escalation: Nano, then Super, then Ultra for later rounds
-- [ ] Harder multi-file demo repo
+- [x] Model escalation (Nano, then Super, then Ultra), partial-fix merging, rounds build on the best partial fix
+- [x] Harder multi-file demo repo (`examples/bookstore`)
 - [ ] Benchmark on SWE-rebench
 - [ ] Build mode: prompt, then tests, then code
 - [ ] Fine-tuned Nemotron executor from collected trajectories

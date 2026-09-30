@@ -98,8 +98,33 @@ def stage_model(stage: str) -> str:
     """Per-stage models (PLANNER_MODEL etc.) only apply to Nebius; others use one model."""
     cfg = provider_config()
     if cfg["provider"] == "nebius":
-        return os.getenv(f"{stage.upper()}_MODEL") or cfg["model"]
+        return resolve_model(os.getenv(f"{stage.upper()}_MODEL") or cfg["model"])
     return cfg["model"]
+
+
+# Short names for the Nemotron 3 family on Nebius Token Factory (check yours with scripts/list_models.py)
+MODEL_ALIASES = {
+    "nano": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
+    "super": "nvidia/nemotron-3-super-120b-a12b",
+    "ultra": "nvidia/Nemotron-3-Ultra-550b-a55b",
+}
+
+
+def resolve_model(name: str) -> str:
+    return MODEL_ALIASES.get((name or "").strip().lower(), (name or "").strip())
+
+
+def parse_ladder(spec: Optional[str]) -> list[str]:
+    """'nano,super,ultra' -> full model ids. Round r of the executor uses ladder[r-1]
+    (the last entry repeats), so cheap models try first and big ones only when needed."""
+    return [resolve_model(m) for m in (spec or "").split(",") if m.strip()]
+
+
+def executor_model(state: dict, rnd: int) -> str:
+    ladder = state.get("ladder") or []
+    if ladder and provider_config()["provider"] == "nebius":
+        return ladder[min(rnd, len(ladder)) - 1]
+    return stage_model("executor")
 
 
 _client = None
@@ -349,11 +374,14 @@ def safe_path(root: str, rel: str) -> Path:
     return p
 
 
-def copy_repo(src: str, dst: str) -> None:
+def copy_repo(src: str, dst: str, origin: Optional[str] = None) -> None:
+    """Copy src to dst. origin is the untouched repo the copy descends from (defaults to
+    src): the sandbox checkpoint, tamper guard and diffs are all relative to it, so a
+    branch seeded from an earlier partial fix still shares the one repo checkpoint."""
     if Path(dst).exists():
         shutil.rmtree(dst)
     shutil.copytree(src, dst, ignore=shutil.ignore_patterns(*IGNORE_DIRS))
-    ORIGIN[str(Path(dst).resolve())] = str(Path(src).resolve())
+    ORIGIN[str(Path(dst).resolve())] = str(Path(origin or src).resolve())
 
 
 def collect_files(root: str) -> dict[str, str]:
@@ -564,6 +592,11 @@ class GraphState(TypedDict, total=False):
     baseline_passed: bool
     baseline_output: str
     baseline_total: int        # tests in the suite at baseline (pytest only, else 0)
+    ladder: list[str]          # executor model per round (escalation); empty = EXECUTOR_MODEL
+    start_dir: Optional[str]   # where new branches start: the repo, or the best partial fix so far
+    start_output: str          # test output at start_dir
+    start_passed: int          # tests passing at start_dir
+    progress: str              # what earlier rounds achieved, for the planner
     round: int
     strategies: list[str]
     feedback: str
@@ -589,7 +622,9 @@ def baseline_node(state: GraphState) -> dict:
     log(f"[baseline] tests {'GREEN' if code == 0 else 'RED'} (exit {code})"
         + (f" | {counts}" if counts else ""))
     return {"baseline_passed": code == 0, "baseline_output": tail(out),
-            "baseline_total": total, "round": 0}
+            "baseline_total": total, "round": 0,
+            "start_dir": None, "start_output": tail(out), "start_passed": counts.get("passed", 0),
+            "progress": ""}
 
 
 PLANNER_PROMPT = """You are the planner for an autonomous coding agent that fixes failing Python test suites.
@@ -604,9 +639,13 @@ Reply ONLY with JSON: {{"strategies": ["...", "..."]}}"""
 def planner_node(state: GraphState) -> dict:
     n = state["n_branches"]
     rnd = state.get("round", 0) + 1
+    start = state.get("start_dir") or state["repo_dir"]
+    failing = state.get("start_output") or state["baseline_output"]
     user = (f"Task: {state['task']}\n\nRepo files:\n"
-            f"{repo_context(state['repo_dir'], state['baseline_output'])}\n\n"
-            f"Failing test output:\n{state['baseline_output']}")
+            f"{repo_context(start, failing)}\n\n"
+            f"Failing test output:\n{failing}")
+    if state.get("progress"):
+        user += f"\n\nProgress so far (already applied to the code above, keep it):\n{state['progress']}"
     if state.get("feedback"):
         user += f"\n\nFeedback from the previous round (these attempts failed):\n{state['feedback']}"
 
@@ -629,11 +668,16 @@ def planner_node(state: GraphState) -> dict:
 
 
 def fan_out(state: GraphState) -> list[Send]:
-    """One parallel executor branch per strategy."""
+    """One parallel executor branch per strategy, all on this round's model."""
+    model = executor_model(state, state["round"])
     return [
         Send("executor", {
             "branch_id": f"r{state['round']}_b{k}",
             "round": state["round"],
+            "model": model,
+            "start_dir": state.get("start_dir"),
+            "start_output": state.get("start_output") or state["baseline_output"],
+            "progress": state.get("progress", ""),
             "strategy": s,
             "task": state["task"],
             "repo_dir": state["repo_dir"],
@@ -677,7 +721,9 @@ def _cancel_event(key: str) -> threading.Event:
 def executor_node(payload: dict) -> dict:
     bid = payload["branch_id"]
     workdir = str(Path(payload["work_root"]) / payload["run_id"] / bid)
-    copy_repo(payload["repo_dir"], workdir)
+    start = payload.get("start_dir") or payload["repo_dir"]
+    failing = payload.get("start_output") or payload["baseline_output"]
+    copy_repo(start, workdir, origin=payload["repo_dir"])
     test_cmd = payload["test_cmd"].strip()
     baseline_total = payload.get("baseline_total", 0)
     first_green = payload.get("first_green", True)
@@ -689,9 +735,12 @@ def executor_node(payload: dict) -> dict:
         {"role": "user", "content": (
             f"Task: {payload['task']}\nTest command: {test_cmd}\n"
             f"Strategy: {payload['strategy']}\n\n"
-            f"Repo files:\n{repo_context(payload['repo_dir'], payload['baseline_output'])}\n\n"
-            f"Failing output:\n{payload['baseline_output']}")},
+            f"Repo files:\n{repo_context(start, failing)}\n\n"
+            f"Failing output:\n{failing}")},
     ]
+    if payload.get("progress"):
+        messages[1]["content"] += (f"\n\nThis copy already contains a partial fix from an earlier round "
+                                   f"({payload['progress']}). Build on it; don't undo it.")
     model = payload.get("model") or stage_model("executor")
     tin = tout = turns = tool_calls = refused = 0
     usd = 0.0
@@ -815,10 +864,103 @@ def pick_winner(results: list[dict], rnd: int) -> Optional[dict]:
     return min(green, key=lambda r: (r["diff_lines"], r["input_tokens"] + r["output_tokens"]))
 
 
+def passed_count(r: dict) -> int:
+    return pytest_counts(r.get("test_output", "")).get("passed", 0)
+
+
+def _changed_rel(a_dir: str, b_dir: str) -> set[str]:
+    """Files that differ between two copies of the repo (edited, added or deleted)."""
+    a, b = _repo_files(a_dir), _repo_files(b_dir)
+    return {rel for rel in set(a) | set(b)
+            if rel not in a or rel not in b or a[rel].read_bytes() != b[rel].read_bytes()}
+
+
+def merge_partials(state: GraphState) -> Optional[dict]:
+    """No branch is green. Branches that each fixed *some* tests often fixed different bugs
+    in different files, so combine them: start from the best one, add each other branch's
+    files if they don't overlap, and keep the addition only if more tests pass.
+    No model calls, just a few judged test runs. Returns a result dict or None."""
+    rnd, repo = state["round"], state["repo_dir"]
+    start = state.get("start_dir") or repo
+    floor = state.get("start_passed", 0)
+    cands = sorted((r for r in state["results"]
+                    if r["round"] == rnd and not r["passed"] and not r.get("cancelled")
+                    and passed_count(r) > floor),
+                   key=passed_count, reverse=True)
+    if len(cands) < 2:
+        return None
+
+    mdir = str(Path(state["work_root"]) / state["run_id"] / f"r{rnd}_merge")
+    copy_repo(cands[0]["workdir"], mdir, origin=repo)
+    used, taken = [cands[0]["branch_id"]], _changed_rel(start, cands[0]["workdir"])
+    best, out = passed_count(cands[0]), cands[0]["test_output"]
+    code = 1
+    for r in cands[1:]:
+        files = {f for f in _changed_rel(start, r["workdir"]) if not is_protected(f)}
+        if not files or files & taken:
+            continue                                      # nothing new, or conflicts with what we have
+        backup = {f: (Path(mdir) / f).read_bytes() if (Path(mdir) / f).exists() else None for f in files}
+        for f in files:
+            src, dst = Path(r["workdir"]) / f, Path(mdir) / f
+            if src.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+            elif dst.exists():
+                dst.unlink()
+        c, o, _ = judge(mdir, state["test_cmd"], state.get("baseline_total", 0))
+        n = pytest_counts(o).get("passed", 0)
+        if c == 0 or n > best:
+            used.append(r["branch_id"]); taken |= files
+            best, out, code = n, o, c
+            if c == 0:
+                break
+        else:                                             # made things worse: undo
+            for f, data in backup.items():
+                dst = Path(mdir) / f
+                if data is None:
+                    dst.unlink(missing_ok=True)
+                else:
+                    dst.write_bytes(data)
+    if len(used) < 2:
+        return None
+    diff = make_diff(repo, mdir)
+    log(f"[merge] round {rnd}: combined {' + '.join(used)} -> "
+        f"{'GREEN' if code == 0 else f'{best} tests passing'}")
+    return {"branch_id": f"r{rnd}_merge", "round": rnd, "strategy": f"Merge of {', '.join(used)}",
+            "model": "merge (no LLM)", "passed": code == 0, "cancelled": False, "stop_reason": "merged",
+            "test_output": tail(out, 2000), "workdir": mdir, "diff_lines": diff["lines"],
+            "changed": diff["changed"], "patch": diff["patch"], "turns": 0, "tool_calls": 0,
+            "input_tokens": 0, "output_tokens": 0, "usd": 0.0, "refused_writes": 0, "tampered": [],
+            "messages": None}
+
+
 def selector_node(state: GraphState) -> dict:
     w = pick_winner(state["results"], state["round"])
+    update: dict = {}
+    if not w:
+        merged = merge_partials(state)
+        if merged:
+            update["results"] = [merged]
+            if merged["passed"] and merged["diff_lines"] > 0:
+                w = merged
+        # Carry the best partial fix into the next round instead of starting over.
+        pool = [r for r in state["results"] if r["round"] == state["round"]
+                and not r["passed"] and not r.get("cancelled")] + ([merged] if merged else [])
+        best = max(pool, key=passed_count, default=None)
+        if not w and best and passed_count(best) > state.get("start_passed", 0):
+            n0 = state.get("baseline_total", 0)
+            update.update({
+                "start_dir": best["workdir"], "start_output": best["test_output"],
+                "start_passed": passed_count(best),
+                "progress": (f"{best['branch_id']} ({best['strategy'][:120]}) got "
+                             f"{passed_count(best)}{f'/{n0}' if n0 else ''} tests passing, "
+                             f"changing {', '.join(best['changed'])}"),
+            })
+            log(f"[selector] next round starts from {best['branch_id']} "
+                f"({passed_count(best)} tests passing)")
     log(f"[selector] round {state['round']}: " + (f"winner {w['branch_id']}" if w else "no green branch"))
-    return {"winner": w}
+    update["winner"] = w
+    return update
 
 
 REFLECTOR_PROMPT = """You are the reflector of an autonomous coding agent. Several parallel fix attempts failed.
@@ -1047,9 +1189,10 @@ def run(repo: str, task: str, test_cmd: str = "pytest -q", branches: int = 3, ro
         max_turns: int = 15, apply: bool = False, work_root: Optional[str] = None,
         make_branch: bool = True, on_log=None, full: bool = False,
         first_green: bool = True, thinking: Optional[str] = None,
-        max_usd: Optional[float] = None) -> dict:
+        max_usd: Optional[float] = None, ladder: Optional[str] = None) -> dict:
     """Returns the summary dict, or the full final graph state when full=True.
-    max_usd: stop starting new LLM calls once this run has spent this much."""
+    max_usd: stop starting new LLM calls once this run has spent this much.
+    ladder: executor model per round, e.g. "nano,super,ultra" (default: EXECUTOR_LADDER)."""
     global _log_hook
     repo_dir = str(Path(repo).resolve())
     if not Path(repo_dir).is_dir():
@@ -1065,6 +1208,7 @@ def run(repo: str, task: str, test_cmd: str = "pytest -q", branches: int = 3, ro
         "first_green": first_green,
         "thinking": thinking or os.getenv("EXECUTOR_THINKING") or None,
         "max_usd": max_usd,
+        "ladder": parse_ladder(ladder if ladder is not None else os.getenv("EXECUTOR_LADDER")),
         "results": [], "usage": [], "feedback": "",
     }
     _budgets[state["run_id"]] = Budget(max_usd)
@@ -1090,13 +1234,15 @@ def main():
                     help="Let every branch finish instead of stopping at the first green one")
     ap.add_argument("--thinking", choices=["on", "low", "off"], default=None,
                     help="Executor reasoning mode (Nemotron 3); default: model default")
+    ap.add_argument("--ladder", default=None,
+                    help="Executor model per round, e.g. nano,super,ultra (default: EXECUTOR_LADDER)")
     ap.add_argument("--max-usd", type=float, default=None,
                     help="Spend cap for this run in USD (default: MAX_USD_PER_RUN or no cap)")
     a = ap.parse_args()
 
     s = run(a.repo, a.task, a.test_cmd, a.branches, a.rounds, a.max_turns, a.apply,
             make_branch=not a.no_branch, first_green=not a.all_branches, thinking=a.thinking,
-            max_usd=a.max_usd)
+            max_usd=a.max_usd, ladder=a.ladder)
     print("\n=== SUMMARY ===")
     g = s.get("git") or {}
     if g.get("branch"):
