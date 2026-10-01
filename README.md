@@ -12,7 +12,7 @@
 
 *Nebius x NVIDIA Global AI Hackathon, **Coding and Agentic Engineering** track*
 
-**[Demo video](#) · [Live demo](#)**
+**[▶ Live demo](https://codefork-a3ad22kq5xdu5zq5sj3ase.streamlit.app/) · [Demo video](#)**
 
 </div>
 
@@ -81,6 +81,7 @@ Real runs with Nemotron 3 on Token Factory and Nebius Sandboxes, 3 parallel bran
 | 30 Sep | `bookstore` (7 bugs, 5 modules) | green, 2 rounds | Round 1 on Nano reached 17/18 tests; round 2 on Super started from that partial fix and finished in 2 turns. The tamper guard refused an edit to `tests/test_orders.py`. Logs showed Nano repeating one edit 10 times and fighting `/app/...` paths | $0.056 |
 | 1 Oct | `invoice` | green, 1 round | After the minimal-change prompts: all 3 branches green in 3–4 turns, winning diff **10 lines** | $0.012 |
 | 1 Oct | `bookstore` | green, 2 rounds | Stuck branches now end early (6 turns instead of 15) and executor spend fell. Round 2 on Super fixed the last bug in **1 turn** | $0.084 |
+| 1 Oct | `invoice`, **live on the hosted demo** | green, 1 round | Run from Streamlit Community Cloud against Nebius, with planning and reflection reasoning off: 65 s end to end | $0.009 |
 
 **What the numbers taught us.** On 1 Oct, Ultra's reasoning tokens in planning and reflection were 68% of the bookstore cost ($0.058 of $0.084): the reflector wrote 7,889 tokens to produce a 150-word note. Reasoning "low" barely changed that, so planning and reflection now run with reasoning **off**, and the planner splits independent bugs across branches so partial fixes can be merged.
 
@@ -93,7 +94,9 @@ The same Streamlit app runs as a public demo with `HOSTED=1`:
 - **Spending is bounded:** live runs need an access code (`DEMO_ACCESS_CODE`), each run has a hard cap (`HOSTED_MAX_USD_PER_RUN`), the whole demo has a daily budget (`DAILY_BUDGET_USD`), and only one live run happens at a time.
 - The "local" sandbox is never offered; every command runs in Nebius Sandboxes.
 
-**Deploy on Streamlit Community Cloud:** New app → this repo, branch `main`, file `graph_app.py`, Python 3.12 → Advanced settings → paste `.streamlit/secrets.toml.example` filled in → Deploy.
+**It's live at https://codefork-a3ad22kq5xdu5zq5sj3ase.streamlit.app/** (replays are open to everyone; live runs need the access code given in the hackathon submission).
+
+**Deploy your own on Streamlit Community Cloud:** New app → this repo, branch `main`, file `graph_app.py`, Python 3.12 → Advanced settings → paste `.streamlit/secrets.toml.example` filled in → Deploy.
 
 ## Tamper guard
 

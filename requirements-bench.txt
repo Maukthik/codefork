@@ -1,0 +1,4 @@
+-r requirements.txt
+huggingface_hub>=0.24
+pandas>=2.0
+pyarrow>=15
