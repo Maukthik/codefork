@@ -809,3 +809,54 @@ def test_real_errors_are_not_retried(monkeypatch):
     with pytest.raises(ValueError):
         ag.with_retry(bad, "x")
     assert calls["n"] == 1
+
+
+# --- logging and replays (hosted demo) --------------------------------------------------
+
+def test_executor_logs_reach_the_callers_hook(repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(ag, "chat", make_fake_chat([["GOOD fix", "bad"]]))
+    seen = []
+    ag.run(str(repo), "fix", branches=2, rounds=1, work_root=str(tmp_path / "b"),
+           make_branch=False, on_log=seen.append)
+    assert any(l.startswith("[r1_b0]") for l in seen)              # from a parallel branch thread
+    assert any(l.startswith("[planner]") for l in seen)
+
+
+def test_two_runs_at_once_keep_their_logs_separate(tmp_path, monkeypatch):
+    monkeypatch.setenv("SANDBOX", "local")
+    monkeypatch.setattr(ag, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(ag, "chat", make_fake_chat([["GOOD fix"]]))
+    repos = []
+    for name in ("one", "two"):
+        r = tmp_path / name
+        r.mkdir()
+        (r / "calc.py").write_text(BUGGY); (r / "test_calc.py").write_text(TEST)
+        repos.append(r)
+    logs = {"one": [], "two": []}
+    threads = [threading.Thread(target=ag.run, args=(str(r), "fix"),
+                                kwargs=dict(branches=1, rounds=1, work_root=str(tmp_path / f"b_{r.name}"),
+                                            make_branch=False, on_log=logs[r.name].append))
+               for r in repos]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    for name, other in (("one", "two"), ("two", "one")):
+        assert logs[name] and not any(f"/{other}" in l or f"\\\\{other}" in l for l in logs[name])
+        assert sum(l.startswith("[baseline]") for l in logs[name]) == 1     # not the other run's
+
+
+def test_replay_file_has_everything_the_ui_needs(repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(ag, "chat", make_fake_chat([["GOOD fix"]]))
+    s = ag.run(str(repo), "fix", branches=1, rounds=1, work_root=str(tmp_path / "b"), make_branch=False)
+    rec = json.loads((tmp_path / "logs" / f"graph_{s['run_id']}_replay.json").read_text(encoding="utf-8"))
+    assert rec["summary"]["status"] == "green" and rec["winner"] == "r1_b0"
+    assert any("[planner]" in l for l in rec["logs"]) and rec["results"][0]["patch"]
+    assert "messages" not in rec["results"][0] and "workdir" not in rec["results"][0]
+
+
+def test_thinking_emitted_as_a_tool_call_gets_a_nudge(tmp_path):
+    r = ag.run_tool(str(tmp_path), "analysis", {})
+    assert r.startswith("Noted") and "edit_file" in r
+
+
+def test_planner_is_told_to_split_independent_bugs():
+    assert "split them" in ag.PLANNER_PROMPT and "merged automatically" in ag.PLANNER_PROMPT

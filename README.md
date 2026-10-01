@@ -52,8 +52,9 @@ Built as a [LangGraph](https://github.com/langchain-ai/langgraph) `StateGraph`. 
 | Piece | File |
 |---|---|
 | Graph, nodes, sandbox, tamper guard, cost tracking | `agent_graph.py` |
-| Streamlit UI: run, watch live, compare branches, approve or reject | `graph_app.py` |
-| Offline test suite (fake LLM, fake sandbox, 56 tests) | `test_agent_graph.py` |
+| Streamlit UI: run, watch live, compare branches, approve or reject; hosted demo mode | `graph_app.py` |
+| Hosted demo helpers: demo repos, GitHub import, access code, spend caps, replays | `hosting.py` |
+| Offline tests (fake LLM, fake sandbox, headless UI tests): 83 tests | `test_agent_graph.py`, `test_hosting.py` |
 | Demo repos with planted bugs: `invoice` (3 bugs, 2 files), `bookstore` (7 bugs, 5 modules) | `examples/` |
 
 ## How NVIDIA Nemotron and Nebius are used
@@ -72,14 +73,27 @@ Every run reports tokens and **USD cost per stage**, and you can cap spend per r
 
 ## Results on Nebius
 
-Real runs with Nemotron 3 on Token Factory and Nebius Sandboxes, 3 parallel branches:
+Real runs with Nemotron 3 on Token Factory and Nebius Sandboxes, 3 parallel branches. Both 1 Oct runs are in `examples/recorded/` and can be replayed in the app.
 
-| Demo | Bugs | Result | What happened | Cost |
+| Date | Demo | Result | What happened | Cost |
 |---|---|---|---|---|
-| `invoice` | 3 bugs, 2 files | green in 1 round | Ultra planned 3 strategies, a Nano branch fixed both files in 5 turns | $0.011 |
-| `bookstore` | 7 bugs, 5 modules | green in 2 rounds | Round 1 on Nano: best branch reached 17/18 tests. Round 2 started from that partial fix on Super and finished in 2 turns. One Nano branch tried to edit `tests/test_orders.py`; the tamper guard refused it | $0.056 |
+| 30 Sep | `invoice` (3 bugs, 2 files) | green, 1 round | Nano fixed both files, but the winning diff was a 27-line refactor | $0.011 |
+| 30 Sep | `bookstore` (7 bugs, 5 modules) | green, 2 rounds | Round 1 on Nano reached 17/18 tests; round 2 on Super started from that partial fix and finished in 2 turns. The tamper guard refused an edit to `tests/test_orders.py`. Logs showed Nano repeating one edit 10 times and fighting `/app/...` paths | $0.056 |
+| 1 Oct | `invoice` | green, 1 round | After the minimal-change prompts: all 3 branches green in 3–4 turns, winning diff **10 lines** | $0.012 |
+| 1 Oct | `bookstore` | green, 2 rounds | Stuck branches now end early (6 turns instead of 15) and executor spend fell. Round 2 on Super fixed the last bug in **1 turn** | $0.084 |
 
-The bookstore logs also showed Nano repeating an identical edit ten times and fighting absolute `/app/...` paths; the stuck-branch detection, path mapping and snippet-edit tool were added in response.
+**What the numbers taught us.** On 1 Oct, Ultra's reasoning tokens in planning and reflection were 68% of the bookstore cost ($0.058 of $0.084): the reflector wrote 7,889 tokens to produce a 150-word note. Reasoning "low" barely changed that, so planning and reflection now run with reasoning **off**, and the planner splits independent bugs across branches so partial fixes can be merged.
+
+## Hosted demo
+
+The same Streamlit app runs as a public demo with `HOSTED=1`:
+
+- **Replay a recorded run** (default, free): real Nebius runs from `examples/recorded/`, played back step by step with every branch, cost and the final patch. No model calls.
+- **Run live** on a bundled demo repo or **any small public GitHub repo** (downloaded as a zip, up to 400 files). Each visitor gets a fresh copy; the fix comes back as a downloadable `git apply`-able patch.
+- **Spending is bounded:** live runs need an access code (`DEMO_ACCESS_CODE`), each run has a hard cap (`HOSTED_MAX_USD_PER_RUN`), the whole demo has a daily budget (`DAILY_BUDGET_USD`), and only one live run happens at a time.
+- The "local" sandbox is never offered; every command runs in Nebius Sandboxes.
+
+**Deploy on Streamlit Community Cloud:** New app → this repo, branch `main`, file `graph_app.py`, Python 3.12 → Advanced settings → paste `.streamlit/secrets.toml.example` filled in → Deploy.
 
 ## Tamper guard
 
@@ -167,16 +181,19 @@ All settings live in `.env` (see `.env.example`). The important ones:
 python -m pytest -q
 ```
 
-56 tests. They script the model's replies and fake the Nebius sandbox, so they need **no API key, no network and no credits**, and they run in CI on every push. They cover the graph (branching, reflection, first-green cancellation, budget cap, escalation, partial-fix merging, carrying progress between rounds), the tamper guard, the Nebius checkpoint and overlay logic, git review branches, patch output and line endings.
+83 tests. They script the model's replies and fake the Nebius sandbox, so they need **no API key, no network and no credits**, and they run in CI on every push. They cover the graph (branching, reflection, first-green cancellation, budget cap, escalation, partial-fix merging, carrying progress between rounds), the tamper guard, the Nebius checkpoint and overlay logic, git review branches, patch output and line endings, concurrent runs keeping separate logs, sandbox retries, GitHub zip import (size limits, path-traversal checks) and the Streamlit app itself, driven headless with `streamlit.testing`.
 
 ## Project layout
 
 ```
 .
 ├── agent_graph.py          # the agent (LangGraph)
-├── graph_app.py            # Streamlit UI
-├── test_agent_graph.py     # offline tests
-├── examples/               # demo repos with planted bugs
+├── graph_app.py            # Streamlit UI (local and hosted)
+├── hosting.py              # hosted demo: repo import, access code, budgets, replays
+├── test_agent_graph.py     # offline agent tests
+├── test_hosting.py         # hosting + headless UI tests
+├── examples/               # demo repos with planted bugs; recorded/ = replayable runs
+├── .streamlit/             # app config and secrets template
 ├── scripts/                # make_demo, list_models, connectivity checks
 ├── legacy/                 # first single-agent version (planner, executor, reflector loop)
 └── .github/workflows/      # CI
@@ -192,6 +209,7 @@ python -m pytest -q
 - [x] Model escalation (Nano, then Super, then Ultra), partial-fix merging, rounds build on the best partial fix
 - [x] Harder multi-file demo repo (`examples/bookstore`)
 - [x] Tuned from real runs: snippet edit tool, stuck-branch detection, `/app` path mapping, tool-name aliases, minimal-change planning
+- [x] Hosted demo: replays, live runs on demos or GitHub repos, access code and spend caps
 - [ ] Benchmark on SWE-rebench
 - [ ] Build mode: prompt, then tests, then code
 - [ ] Fine-tuned Nemotron executor from collected trajectories

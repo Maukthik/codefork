@@ -24,6 +24,7 @@ in the target repo WITHOUT touching your working tree. Review it, then merge.
 from __future__ import annotations
 
 import argparse
+import contextvars
 import difflib
 import fnmatch
 import hashlib
@@ -52,14 +53,18 @@ BASE_DIR = Path(__file__).resolve().parent
 IGNORE_DIRS = {".git", ".venv", "venv", "__pycache__", ".pytest_cache", "node_modules", ".mypy_cache"}
 MAX_FILE_BYTES = 1_000_000
 
-_log_hook = None  # set by run(on_log=...) so a UI can stream progress
+# Where log lines go besides stdout. A ContextVar (not a global) so two runs at once, e.g.
+# two visitors on the hosted demo, each get only their own lines. LangGraph copies the
+# context into the threads that run parallel branches, so executor logs arrive too.
+_log_sink: contextvars.ContextVar = contextvars.ContextVar("fork_log_sink", default=None)
 
 
 def log(msg: str) -> None:
     print(msg, flush=True)
-    if _log_hook:
+    sink = _log_sink.get()
+    if sink:
         try:
-            _log_hook(msg)
+            sink(msg)
         except Exception:
             pass
 
@@ -608,6 +613,8 @@ def write_preserving_newlines(p: Path, content: str) -> None:
 
 
 TOOL_NAMES = [t["function"]["name"] for t in TOOLS]
+# With reasoning switched off, Nemotron sometimes emits its thinking as a tool call
+THINK_NAMES = {"think", "analysis", "analyze", "reasoning", "thought", "plan"}
 # Names models reach for from other agent frameworks, mapped onto ours
 TOOL_ALIASES = {"str_replace_editor": "edit_file", "str_replace": "edit_file",
                 "replace_in_file": "edit_file", "view": "read_file", "cat": "read_file",
@@ -639,6 +646,8 @@ def run_tool(workdir: str, name: str, args: dict, protect: bool = True) -> str:
     """Results starting with 'Wrote'/'Edited' mean the code changed (tests auto-run);
     'No change' means the edit was identical to what's there (counts as no progress)."""
     name, args = _normalize_call(name, args)
+    if name in THINK_NAMES:
+        return f"Noted. Now act: call one of {', '.join(TOOL_NAMES)}."
     try:
         if name == "list_files":
             return "\n".join(list_files(workdir)) or "(empty)"
@@ -746,7 +755,11 @@ concrete instruction (1-3 sentences) naming the files/functions to look at and t
 Make them genuinely different (different root-cause hypotheses or approaches), not rewordings.
 Base every strategy on the actual code shown; don't guess at bugs you can't see in it.
 Prefer the smallest change that fixes the root cause: edit the buggy lines. Don't add new
-functions, classes or refactors unless a test needs them. Name files by their path from the repo root.
+functions, classes, modules or refactors unless a test needs them; make strategies differ in
+diagnosis, not in how much code they rewrite. Name files by their path from the repo root.
+If the failures come from several independent bugs in different files, split them: give each
+strategy a different group of failing tests and the files behind them (partial fixes in separate
+files are merged automatically), and let one strategy try to fix everything.
 Never suggest editing or deleting tests to make them pass.
 Reply ONLY with JSON: {{"strategies": ["...", "..."]}}"""
 
@@ -1342,7 +1355,6 @@ def run(repo: str, task: str, test_cmd: str = "pytest -q", branches: int = 3, ro
     """Returns the summary dict, or the full final graph state when full=True.
     max_usd: stop starting new LLM calls once this run has spent this much.
     ladder: executor model per round, e.g. "nano,super,ultra" (default: EXECUTOR_LADDER)."""
-    global _log_hook
     repo_dir = str(Path(repo).resolve())
     if not Path(repo_dir).is_dir():
         raise FileNotFoundError(repo_dir)
@@ -1361,12 +1373,43 @@ def run(repo: str, task: str, test_cmd: str = "pytest -q", branches: int = 3, ro
         "results": [], "usage": [], "feedback": "",
     }
     _budgets[state["run_id"]] = Budget(max_usd)
-    _log_hook = on_log
+    lines: list[str] = []
+
+    def sink(msg: str) -> None:
+        lines.append(msg)
+        if on_log:
+            on_log(msg)
+
+    token = _log_sink.set(sink)
     try:
         final = build_graph().invoke(state, {"recursion_limit": 10 + rounds * 6})
     finally:
-        _log_hook = None
+        _log_sink.reset(token)
+    save_replay(final, lines)
     return final if full else final["summary"]
+
+
+REPLAY_FIELDS = ("branch_id", "round", "strategy", "model", "passed", "cancelled", "stop_reason",
+                 "test_output", "diff_lines", "changed", "patch", "turns", "tool_calls",
+                 "input_tokens", "output_tokens", "usd", "refused_writes", "tampered")
+
+
+def save_replay(final: dict, lines: list[str]) -> Path:
+    """Everything the UI needs to show a finished run again without calling any model:
+    the log lines in order, the summary and every branch (minus conversations and local paths).
+    Copy one into examples/recorded/ and the hosted demo can replay it for free."""
+    w = final.get("winner") or {}
+    record = {
+        "run_id": final["run_id"], "repo": Path(final["repo_dir"]).name, "task": final["task"],
+        "test_cmd": final["test_cmd"], "baseline_output": final.get("baseline_output", ""),
+        "logs": lines, "summary": final["summary"],
+        "results": [{k: r.get(k) for k in REPLAY_FIELDS} for r in final.get("results", [])],
+        "winner": w.get("branch_id"),
+    }
+    path = BASE_DIR / "logs" / f"graph_{final['run_id']}_replay.json"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps(record, indent=1, ensure_ascii=False), encoding="utf-8")
+    return path
 
 
 def main():
