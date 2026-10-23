@@ -41,8 +41,8 @@ def make(name: str, force: bool) -> None:
     git(dst, "init", "-q", "-b", "main")
     git(dst, "add", "-A")
     git(dst, "-c", "user.name=Fork Demo", "-c", "user.email=demo@localhost",
-        "commit", "-q", "-m", f"{name} demo (buggy)")
-    print(f"Created workspace/{name}. Check it fails:  python -m pytest -q workspace/{name}")
+        "commit", "-q", "-m", f"{name} demo")
+    print(f"Created workspace/{name}. Check its tests:  python -m pytest -q workspace/{name}")
 
 
 def available() -> list[str]:

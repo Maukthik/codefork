@@ -2,6 +2,7 @@
 agent_graph.py - LangGraph version of Fork with parallel branching.
 
 Flow:
+    [build mode: spec_writer writes the tests first -> they become read-only]
     baseline -> (already green? -> finalize)
              -> planner -> [executor x N in parallel] -> selector
              -> (winner? -> finalize)
@@ -14,9 +15,11 @@ branches never overwrite each other. SANDBOX=local exists only for tests.
 Usage:
     python agent_graph.py --repo workspace/myrepo --task "Make the failing tests pass"
     python agent_graph.py --repo workspace/myrepo --branches 3 --rounds 2
+    python agent_graph.py --repo workspace/library --build "Add overdue fines: ..."
 
 By default the winning fix is committed to a new git branch (fork/fix-<run_id>)
 in the target repo WITHOUT touching your working tree. Review it, then merge.
+In build mode the branch is fork/build-<run_id> and holds the new tests and the code.
     --apply      also copy the fix into the working tree
     --no-branch  skip the git branch (patch file only)
 """
@@ -24,6 +27,7 @@ in the target repo WITHOUT touching your working tree. Review it, then merge.
 from __future__ import annotations
 
 import argparse
+import ast
 import contextvars
 import difflib
 import fnmatch
@@ -727,6 +731,13 @@ class GraphState(TypedDict, total=False):
     winner: Optional[dict]
     summary: dict
 
+    # build mode: the tests are written from a feature request before any code
+    mode: str                  # "fix" (default) or "build"
+    request: str               # the feature request, in plain English
+    target_repo: str           # the user's repo; repo_dir points at the spec copy during the run
+    spec: dict                 # the test files written, their count, summary, interface
+    expected_tests: int        # tests the judge must see pass (new tests may not import yet)
+
 
 # ---------------------------------------------------------------------------
 # Nodes
@@ -741,6 +752,9 @@ def baseline_node(state: GraphState) -> dict:
         raise RuntimeError("pytest collected no tests. Check the repo path and test file names.")
     counts = pytest_counts(out)
     total = sum(counts.get(k, 0) for k in ("passed", "failed", "error"))
+    # Build mode: new tests that can't even import yet show up as one collection error, so the
+    # count comes from the spec writer instead. The judge then needs every one of them to pass.
+    total = max(total, state.get("expected_tests", 0))
     log(f"[baseline] tests {'GREEN' if code == 0 else 'RED'} (exit {code})"
         + (f" | {counts}" if counts else ""))
     return {"baseline_passed": code == 0, "baseline_output": tail(out),
@@ -749,7 +763,8 @@ def baseline_node(state: GraphState) -> dict:
             "progress": ""}
 
 
-PLANNER_PROMPT = """You are the planner for an autonomous coding agent that fixes failing Python test suites.
+PLANNER_PROMPT = """You are the planner for an autonomous coding agent that makes failing Python test suites pass
+(fixing bugs, or in build mode implementing a new feature whose tests were just written).
 Propose exactly {n} DIFFERENT strategies to make the tests pass. Each strategy should be a short,
 concrete instruction (1-3 sentences) naming the files/functions to look at and the fix idea.
 Make them genuinely different (different root-cause hypotheses or approaches), not rewordings.
@@ -826,8 +841,9 @@ def fan_out(state: GraphState) -> list[Send]:
 
 EXECUTOR_PROMPT = """You are the executor of an autonomous coding agent. You work inside a copy of a Python repo.
 Tools: list_files, read_file, edit_file, write_file, run_command. The repo's key files are included below.
-Goal: make the test command pass by fixing the source code. Keep changes minimal: fix the buggy
-lines, don't refactor. Follow the strategy you are given.
+Goal: make the test command pass by fixing the source code (or, when the task is to build a
+feature, by writing it). Keep changes minimal: fix the buggy lines or add only what the tests
+need, don't refactor. Follow the strategy you are given.
 
 RULES:
 - Paths are relative to the repo root, e.g. pkg/module.py (not /app/pkg/module.py).
@@ -1147,6 +1163,173 @@ def reflector_node(state: GraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Build mode: write the tests first, then the fix engine writes the code
+# ---------------------------------------------------------------------------
+
+SPEC_ATTEMPTS = int(os.getenv("SPEC_ATTEMPTS", "2"))
+
+SPEC_PROMPT = """You are the spec writer of an autonomous coding agent working in build mode.
+A user describes a feature in plain English. Before any code exists, you write the pytest tests
+that define it. Other agents then write code until your tests pass, and they cannot edit them,
+so the tests ARE the specification.
+
+RULES:
+- Write NEW test files only, following the repo's layout and import style (e.g. tests/test_<feature>.py
+  if the repo keeps tests in tests/). Never rewrite or repeat existing tests.
+- Test behaviour through the public interface. If the request doesn't name functions, classes or
+  arguments, choose clear ones and list them under INTERFACE.
+- 4 to 10 focused, deterministic tests: the main behaviour, every edge case and error the request
+  mentions. No network, no sleeps, no randomness, no private helpers, no file system side effects.
+- The tests must FAIL on the current code (the feature doesn't exist yet) and pass once it's built.
+- Don't contradict existing behaviour or the existing tests.
+
+Reply in exactly this format:
+### SUMMARY
+<one or two sentences: what the tests check>
+### INTERFACE
+<the functions/classes/arguments the implementation must provide>
+### FILE: <path from the repo root>
+```python
+<complete file content>
+```
+(one ### FILE block per test file)"""
+
+_FILE_RE = re.compile(r"^###\s*FILE:\s*`?([^\s`]+)`?\s*\n```[\w+-]*\n(.*?)\n```", re.M | re.S)
+
+
+def _section(text: str, name: str) -> str:
+    m = re.search(rf"^###\s*{name}\s*\n(.*?)(?=^###|\Z)", text, re.M | re.S)
+    return m.group(1).strip() if m else ""
+
+
+def parse_spec(text: str) -> dict:
+    """The spec writer's reply -> {"summary", "interface", "files": {path: content}}."""
+    text = (text or "").replace("\r\n", "\n")
+    files = {}
+    for rel, content in _FILE_RE.findall(text):
+        rel = rel.strip().removeprefix("./")
+        if rel.startswith(APP + "/"):
+            rel = rel[len(APP) + 1:]
+        files[rel] = content.rstrip("\n") + "\n"
+    return {"summary": _section(text, "SUMMARY"), "interface": _section(text, "INTERFACE"),
+            "files": files}
+
+
+def count_tests(source: str) -> int:
+    """Test functions pytest would collect from a file: test_* at module level and in Test* classes."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return 0
+    funcs = (ast.FunctionDef, ast.AsyncFunctionDef)
+    n = sum(1 for node in tree.body if isinstance(node, funcs) and node.name.startswith("test"))
+    for cls in (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name.startswith("Test")):
+        n += sum(1 for node in cls.body if isinstance(node, funcs) and node.name.startswith("test"))
+    return n
+
+
+def validate_spec(repo_dir: str, files: dict[str, str]) -> list[str]:
+    """Problems with the test files the spec writer proposed; [] means they can be used."""
+    if not files:
+        return ["No ### FILE blocks found. Use the exact reply format."]
+    problems = []
+    for rel, content in files.items():
+        try:
+            p = safe_path(repo_dir, rel)
+        except ValueError as e:
+            problems.append(str(e))
+            continue
+        name = Path(rel).name
+        if not (fnmatch.fnmatch(name, "test_*.py") or fnmatch.fnmatch(name, "*_test.py")):
+            problems.append(f"{rel}: test files must be named test_*.py or *_test.py")
+        elif p.exists():
+            problems.append(f"{rel} already exists. Put the new tests in a new file.")
+        try:
+            ast.parse(content)
+        except SyntaxError as e:
+            problems.append(f"{rel}: syntax error on line {e.lineno}: {e.msg}")
+            continue
+        if count_tests(content) == 0:
+            problems.append(f"{rel}: no test functions (they must be named test_*)")
+    return problems
+
+
+def spec_writer_node(state: GraphState) -> dict:
+    """Build mode. Turn the feature request into new test files, check they are valid and
+    RED on the current code, and make a spec copy of the repo that contains them. From here
+    on the spec copy is the repo every branch forks from, so the tamper guard protects the
+    new tests exactly like the old ones."""
+    problem = sandbox_ready()
+    if problem:
+        raise RuntimeError(problem)
+    target, run_id, test_cmd = state["repo_dir"], state["run_id"], state["test_cmd"]
+    request = state.get("request") or state["task"]
+    spec_dir = str(Path(state["work_root"]) / run_id / "spec")
+    model = stage_model("planner")
+    spend = budget(run_id)
+    messages = [
+        {"role": "system", "content": SPEC_PROMPT},
+        {"role": "user", "content": (f"Feature request:\n{request}\n\nTest command: {test_cmd}\n\n"
+                                     f"Repo files:\n{repo_context(target)}")},
+    ]
+    usage, problems, spec, out, attempt = [], ["no attempt made (spend limit)"], {}, "", 0
+    for attempt in range(1, SPEC_ATTEMPTS + 1):
+        if spend.exceeded():
+            break
+        msg, (i, o) = chat(model, messages, max_tokens=EXECUTOR_MAX_TOKENS,
+                           thinking=os.getenv("PLANNER_THINKING") or None)
+        usage.append({"stage": "spec", "round": 0, "model": model, "input": i, "output": o,
+                      "usd": spend.add(model, i, o)})
+        spec = parse_spec(msg.content)
+        problems = validate_spec(target, spec["files"])
+        if not problems:
+            copy_repo(target, spec_dir, origin=spec_dir)   # the spec copy is its own origin
+            for rel, content in spec["files"].items():
+                p = safe_path(spec_dir, rel)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                write_preserving_newlines(p, content)
+            code, out = run_in_sandbox(spec_dir, test_cmd)
+            if code == 0:
+                problems = ["The tests already pass on the current code, so they don't test the new "
+                            "feature. Test behaviour that doesn't exist yet."]
+            elif code == 5:
+                problems = ["pytest collected no tests. Put the files where the repo's tests live "
+                            "(check testpaths in pytest.ini)."]
+        if not problems:
+            break
+        log(f"[spec] attempt {attempt} rejected: {'; '.join(problems)[:200]}")
+        messages += [{"role": "assistant", "content": msg.content or ""},
+                     {"role": "user", "content": "Your tests were rejected:\n- " + "\n- ".join(problems)
+                      + "\nReply again in the same format with corrected files."}]
+
+    files = sorted(spec.get("files", {}))
+    new_tests = sum(count_tests(c) for c in spec.get("files", {}).values())
+    record = {"ok": not problems, "files": files, "tests": new_tests, "summary": spec.get("summary", ""),
+              "interface": spec.get("interface", ""), "attempts": attempt, "problems": problems,
+              "model": model, "content": spec.get("files", {})}
+    if problems:
+        log(f"[spec] couldn't write usable tests after {attempt} attempt(s), stopping")
+        return {"spec": record, "target_repo": target, "usage": usage}
+
+    # How many tests must pass at the end. If the new files can't import yet, pytest stops at
+    # collection and reports no counts, so count the test functions in every test file instead.
+    counts = pytest_counts(out)
+    collected = counts.get("passed", 0) + counts.get("failed", 0)
+    expected = collected or sum(count_tests(c) for rel, c in collect_files(spec_dir).items()
+                                if rel.endswith(".py") and is_protected(rel))
+    log(f"[spec] wrote {', '.join(files)} ({new_tests} new tests, {expected} in the suite), "
+        f"RED as expected. Tests are now read-only.")
+    if record["interface"]:
+        log(f"[spec] interface: {record['interface'][:160]}")
+    task = (f"Build this feature so the new tests pass: {request}\n"
+            f"Interface the tests expect: {record['interface'] or 'see the new tests'}\n"
+            f"New tests (read-only, written from the request): {', '.join(files)}. Create or edit "
+            "source files to implement the feature; keep existing behaviour working.")
+    return {"spec": record, "target_repo": target, "repo_dir": spec_dir, "task": task,
+            "expected_tests": expected, "usage": usage}
+
+
+# ---------------------------------------------------------------------------
 # Git: commit the winning fix to a review branch
 # ---------------------------------------------------------------------------
 
@@ -1165,7 +1348,8 @@ def git_toplevel(path: str) -> Optional[Path]:
         return None
 
 
-def commit_to_branch(repo_dir: str, winner: dict, run_id: str, test_cmd: str) -> dict:
+def commit_to_branch(repo_dir: str, winner: dict, run_id: str, test_cmd: str,
+                     kind: str = "fix", title: str = "") -> dict:
     """Commit the winner's files to a new branch using a temporary git worktree,
     so the user's checkout and working tree are never touched."""
     top = git_toplevel(repo_dir)
@@ -1177,7 +1361,7 @@ def commit_to_branch(repo_dir: str, winner: dict, run_id: str, test_cmd: str) ->
         return {"error": "repo has no commits yet"}
 
     prefix = Path(repo_dir).resolve().relative_to(top)
-    branch = f"fork/fix-{run_id}"
+    branch = f"fork/{kind}-{run_id}"
     note = None
     if git(str(top), "status", "--porcelain", "--untracked-files=no", "--", prefix.as_posix() or "."):
         note = "repo had uncommitted changes; branch is based on the last commit (HEAD)"
@@ -1197,7 +1381,9 @@ def commit_to_branch(repo_dir: str, winner: dict, run_id: str, test_cmd: str) ->
                 dst.unlink()  # file deleted by the agent
             paths.append((prefix / rel).as_posix())
         git(str(wt), "add", "-A", "--", *paths)
-        msg = (f"fork: make tests green ({winner['branch_id']})\n\n"
+        head = (f"fork: build {title.strip().splitlines()[0][:60]}" if kind == "build" and title.strip()
+                else f"fork: make tests green ({winner['branch_id']})")
+        msg = (f"{head}\n\n"
                f"Strategy: {winner['strategy']}\n"
                f"Files: {', '.join(winner['changed'])}\n"
                f"Diff: {winner['diff_lines']} lines | turns {winner['turns']} | "
@@ -1234,7 +1420,7 @@ def save_trajectories(state: GraphState) -> tuple[int, int]:
         record = {
             "run_id": state["run_id"], "branch_id": r["branch_id"], "passed": bool(r.get("passed")),
             "winner": r["branch_id"] == w.get("branch_id"),
-            "repo": Path(state["repo_dir"]).name, "task": state["task"],
+            "repo": Path(state.get("target_repo") or state["repo_dir"]).name, "task": state["task"],
             "test_cmd": state["test_cmd"], "strategy": r["strategy"],
             "model": r.get("model") or stage_model("executor"),
             "thinking": state.get("thinking") or "on",
@@ -1255,6 +1441,15 @@ def finalize_node(state: GraphState) -> dict:
     logs = BASE_DIR / "logs"
     logs.mkdir(exist_ok=True)
     w = state.get("winner")
+    build = state.get("mode") == "build"
+    spec = state.get("spec") or {}
+    repo = state.get("target_repo") or state["repo_dir"]
+    if w and build:
+        # The branch ran against the spec copy, so its diff holds only the code. What the user
+        # gets is everything new relative to their own repo: the tests and the code together.
+        full = make_diff(repo, w["workdir"])
+        w = {**w, "changed": full["changed"], "patch": full["patch"], "diff_lines": full["lines"],
+             "code_diff_lines": w["diff_lines"]}
 
     totals: dict[str, dict] = {}
     for u in state.get("usage", []):
@@ -1270,7 +1465,9 @@ def finalize_node(state: GraphState) -> dict:
     if w:
         if state.get("make_branch", True):
             try:
-                branch = commit_to_branch(state["repo_dir"], w, state["run_id"], state["test_cmd"])
+                branch = commit_to_branch(repo, w, state["run_id"], state["test_cmd"],
+                                          kind="build" if build else "fix",
+                                          title=state.get("request", ""))
             except Exception as e:
                 branch = {"error": str(e)}
         # bytes, not write_text: on Windows write_text turns every \n into \r\n and the
@@ -1280,7 +1477,7 @@ def finalize_node(state: GraphState) -> dict:
             for rel in w["changed"]:
                 src = Path(w["workdir"]) / rel
                 if src.exists():
-                    dst = safe_path(state["repo_dir"], rel)
+                    dst = safe_path(repo, rel)
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, dst)
             applied = True
@@ -1288,9 +1485,16 @@ def finalize_node(state: GraphState) -> dict:
     saved, saved_red = save_trajectories(state)
     _budgets.pop(state["run_id"], None)
 
+    if build and not spec.get("ok"):
+        status = "spec_failed"
+    elif state.get("baseline_passed"):
+        status = "already_green"
+    else:
+        status = "green" if w else "red"
     summary = {
         "run_id": state["run_id"],
-        "status": "already_green" if state.get("baseline_passed") else ("green" if w else "red"),
+        "mode": "build" if build else "fix",
+        "status": status,
         "rounds": state.get("round", 0),
         "winner": w and {k: w[k] for k in ("branch_id", "strategy", "diff_lines", "changed",
                                            "turns", "tool_calls")},
@@ -1307,13 +1511,24 @@ def finalize_node(state: GraphState) -> dict:
         "trajectories_saved": saved,
         "failed_trajectories_saved": saved_red,
     }
+    if build:
+        summary["spec"] = {k: spec.get(k) for k in ("ok", "files", "tests", "summary", "interface",
+                                                     "attempts", "problems")}
     (logs / f"graph_{state['run_id']}.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    return {"summary": summary}
+    return {"summary": summary, "winner": w, "repo_dir": repo}
 
 
 # ---------------------------------------------------------------------------
 # Routing + graph
 # ---------------------------------------------------------------------------
+
+def route_start(state: GraphState) -> str:
+    return "spec_writer" if state.get("mode") == "build" else "baseline"
+
+
+def after_spec(state: GraphState) -> str:
+    return "baseline" if (state.get("spec") or {}).get("ok") else "finalize"
+
 
 def after_baseline(state: GraphState) -> str:
     return "finalize" if state["baseline_passed"] else "planner"
@@ -1330,6 +1545,7 @@ def after_selector(state: GraphState) -> str:
 
 def build_graph():
     g = StateGraph(GraphState)
+    g.add_node("spec_writer", spec_writer_node)
     g.add_node("baseline", baseline_node)
     g.add_node("planner", planner_node)
     g.add_node("executor", executor_node)
@@ -1337,7 +1553,8 @@ def build_graph():
     g.add_node("reflector", reflector_node)
     g.add_node("finalize", finalize_node)
 
-    g.add_edge(START, "baseline")
+    g.add_conditional_edges(START, route_start, ["spec_writer", "baseline"])
+    g.add_conditional_edges("spec_writer", after_spec, ["baseline", "finalize"])
     g.add_conditional_edges("baseline", after_baseline, ["planner", "finalize"])
     g.add_conditional_edges("planner", fan_out, ["executor"])
     g.add_edge("executor", "selector")           # waits for all branches
@@ -1351,8 +1568,10 @@ def run(repo: str, task: str, test_cmd: str = "pytest -q", branches: int = 3, ro
         max_turns: int = 15, apply: bool = False, work_root: Optional[str] = None,
         make_branch: bool = True, on_log=None, full: bool = False,
         first_green: bool = True, thinking: Optional[str] = None,
-        max_usd: Optional[float] = None, ladder: Optional[str] = None) -> dict:
+        max_usd: Optional[float] = None, ladder: Optional[str] = None,
+        build: Optional[str] = None) -> dict:
     """Returns the summary dict, or the full final graph state when full=True.
+    build: a feature request. Build mode writes tests for it first, then the code.
     max_usd: stop starting new LLM calls once this run has spent this much.
     ladder: executor model per round, e.g. "nano,super,ultra" (default: EXECUTOR_LADDER)."""
     repo_dir = str(Path(repo).resolve())
@@ -1371,7 +1590,10 @@ def run(repo: str, task: str, test_cmd: str = "pytest -q", branches: int = 3, ro
         "max_usd": max_usd,
         "ladder": parse_ladder(ladder if ladder is not None else os.getenv("EXECUTOR_LADDER")),
         "results": [], "usage": [], "feedback": "",
+        "mode": "build" if build else "fix", "request": build or "",
     }
+    if build:
+        state["task"] = build
     _budgets[state["run_id"]] = Budget(max_usd)
     lines: list[str] = []
 
@@ -1382,7 +1604,7 @@ def run(repo: str, task: str, test_cmd: str = "pytest -q", branches: int = 3, ro
 
     token = _log_sink.set(sink)
     try:
-        final = build_graph().invoke(state, {"recursion_limit": 10 + rounds * 6})
+        final = build_graph().invoke(state, {"recursion_limit": 12 + rounds * 6})
     finally:
         _log_sink.reset(token)
     save_replay(final, lines)
@@ -1406,6 +1628,11 @@ def save_replay(final: dict, lines: list[str]) -> Path:
         "results": [{k: r.get(k) for k in REPLAY_FIELDS} for r in final.get("results", [])],
         "winner": w.get("branch_id"),
     }
+    if final.get("mode") == "build":
+        spec = final.get("spec") or {}
+        record.update({"mode": "build", "request": final.get("request", ""),
+                       "spec": {k: v for k, v in spec.items() if k != "model"},
+                       "winner_result": {k: w.get(k) for k in REPLAY_FIELDS} if w else None})
     path = BASE_DIR / "logs" / f"graph_{final['run_id']}_replay.json"
     path.parent.mkdir(exist_ok=True)
     path.write_text(json.dumps(record, indent=1, ensure_ascii=False), encoding="utf-8")
@@ -1428,6 +1655,8 @@ def main():
                     help="Executor reasoning mode (Nemotron 3); default: model default")
     ap.add_argument("--ladder", default=None,
                     help="Executor model per round, e.g. nano,super,ultra (default: EXECUTOR_LADDER)")
+    ap.add_argument("--build", default=None, metavar="REQUEST",
+                    help="Build mode: describe a feature; Fork writes the tests first, then the code")
     ap.add_argument("--max-usd", type=float, default=None,
                     help="Spend cap for this run in USD (default: MAX_USD_PER_RUN or no cap)")
     a = ap.parse_args()
@@ -1443,16 +1672,20 @@ def main():
 def _run_cli(a):
     return run(a.repo, a.task, a.test_cmd, a.branches, a.rounds, a.max_turns, a.apply,
             make_branch=not a.no_branch, first_green=not a.all_branches, thinking=a.thinking,
-            max_usd=a.max_usd, ladder=a.ladder)
+            max_usd=a.max_usd, ladder=a.ladder, build=a.build)
 
 
 def _print_summary(a, s):
+    spec = s.get("spec")
+    if spec:
+        print(f"Spec: {spec['tests']} new tests in {', '.join(spec['files']) or '-'}"
+              + ("" if spec["ok"] else f" (rejected: {'; '.join(spec['problems'])})"))
     g = s.get("git") or {}
     if g.get("branch"):
         print(f"Fix committed to branch {g['branch']} ({g['commit']}). Review with:")
         print(f"  git -C {a.repo} diff HEAD {g['branch']}")
         print(f"  git -C {a.repo} merge {g['branch']}")
-    print(json.dumps({k: s[k] for k in ("status", "rounds", "winner", "git", "applied",
+    print(json.dumps({k: s[k] for k in ("mode", "status", "rounds", "winner", "git", "applied",
                                         "tokens_by_stage", "cost_usd", "tamper_attempts")}, indent=2))
 
 

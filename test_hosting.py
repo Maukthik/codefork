@@ -215,3 +215,31 @@ def test_streamlit_cloud_secrets_become_environment(recorded, monkeypatch):
     assert at.sidebar.radio[0].value.startswith("▶️")           # hosted mode came from secrets
     import os
     assert os.environ["NEBIUS_MODEL"] == "nvidia/nemotron-3-super-120b-a12b"
+
+
+@needs_streamlit
+def test_local_app_offers_build_mode(monkeypatch, tmp_path):
+    (tmp_path / "calc.py").write_text("x = 1\n")
+    at = app(monkeypatch).run()
+    kind = next(r for r in at.sidebar.radio if r.label == "What to do")
+    kind.set_value("🏗️ Build a feature").run()
+    assert not at.exception
+    req = next(t for t in at.sidebar.text_area if t.label == "Feature request")
+    assert "overdue fines" in req.value
+    assert not any(t.label == "Task" for t in at.sidebar.text_area)
+
+
+@needs_streamlit
+def test_replay_of_a_build_run_shows_the_tests_first(recorded, monkeypatch):
+    rec = json.loads((recorded / "invoice_demo.json").read_text())
+    rec.update({"mode": "build", "request": "Add multiply", "winner_result": rec["results"][0],
+                "spec": {"ok": True, "files": ["test_multiply.py"], "tests": 2, "attempts": 1,
+                         "summary": "multiply works", "interface": "calc.multiply(a, b)",
+                         "content": {"test_multiply.py": "def test_multiply():\n    assert True\n"}}})
+    (recorded / "invoice_demo.json").write_text(json.dumps(rec))
+    at = app(monkeypatch, HOSTED="1").run()
+    at.select_slider[0].set_value("instant")
+    at.button[0].click().run()
+    assert not at.exception
+    assert any("Tests written first" in h.value for h in at.subheader)
+    assert any("2 new tests" in m.value for m in at.markdown)

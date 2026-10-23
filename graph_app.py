@@ -6,7 +6,8 @@ graph_app.py - Streamlit interface for agent_graph.py (Red to Green).
                                             # access code + spend caps, patch download, replays
 
 Watch the agent live: parallel branches, escalation across models, merged partial fixes,
-the tamper guard and the cost of every step.
+the tamper guard and the cost of every step. Build mode: describe a feature, the agent writes
+the tests first, then the code that makes them pass.
 """
 
 import os
@@ -107,6 +108,33 @@ def reject(state: dict) -> dict:
     return {"ok": True, "msg": "Fix discarded. Your repo is unchanged."}
 
 
+BUILD_EXAMPLE = ("Add overdue fines. return_book should record a fine of ₹5 for every day a book is "
+                 "returned after its due date, capped at ₹100 per loan (no fine on or before the due "
+                 "date). Add Library.fines_owed(member) returning that member's unpaid total, and "
+                 "Library.pay_fine(member, amount) that reduces it; paying more than is owed raises "
+                 "ValueError.")
+
+
+def render_spec(spec: dict) -> None:
+    """Build mode: the tests the agent wrote before writing any code."""
+    st.subheader("1 · Tests written first")
+    if not spec.get("ok"):
+        st.error("Couldn't write usable tests for that request: " + "; ".join(spec.get("problems") or []))
+        return
+    st.write(f"**{spec.get('tests', 0)} new tests** in {', '.join(f'`{f}`' for f in spec.get('files', []))}"
+             f", RED on the current code (attempt {spec.get('attempts', 1)}). They were frozen before "
+             "any code was written; the tamper guard protects them like the original tests.")
+    if spec.get("summary"):
+        st.caption(spec["summary"])
+    if spec.get("interface"):
+        st.markdown("**Interface the tests expect**")
+        st.code(spec["interface"], language="text")
+    for rel, content in (spec.get("content") or {}).items():
+        with st.expander(rel, expanded=True):
+            st.code(content, language="python")
+    st.subheader("2 · Code written to pass them")
+
+
 def show_files(root: str, files: list[str]) -> None:
     for rel in files:
         p = Path(root) / rel
@@ -115,8 +143,12 @@ def show_files(root: str, files: list[str]) -> None:
             st.code(p.read_text(encoding="utf-8", errors="replace"), language="python")
 
 
-def render_results(summary: dict, results: list[dict], winner_id) -> None:
+def render_results(summary: dict, results: list[dict], winner_id, spec: dict = None) -> None:
     """Metrics, every branch of every round, and the winning patch. Used for live runs and replays."""
+    if spec:
+        render_spec(spec)
+    if summary["status"] == "spec_failed":
+        return
     if summary["status"] == "already_green":
         st.success("Tests already pass. Nothing to fix.")
         return
@@ -174,7 +206,8 @@ st.title("🍴 Fork: Red to Green")
 st.write("Give it a repo with failing tests. It tries several fixes **in parallel** in forked Nebius "
          "sandboxes, keeps the smallest one that turns the tests green, and escalates from "
          "**Nemotron 3 Nano → Super → Ultra** only when it has to. Test files are read-only: "
-         "a tamper guard refuses and reverts any attempt to edit them.")
+         "a tamper guard refuses and reverts any attempt to edit them. **Build mode:** describe a "
+         "feature instead, and it writes the tests first, then the code that passes them.")
 with st.expander("How it works"):
     st.markdown(
         "1. **Plan:** Nemotron 3 Ultra reads the code and failing output and proposes several different fixes.\n"
@@ -183,7 +216,10 @@ with st.expander("How it works"):
         "4. **Judge:** green only if the *original* tests pass. The first green branch stops the rest.\n"
         "5. **Merge / escalate:** partial fixes in different files are combined; otherwise the next round "
         "starts from the best partial fix on a bigger model.\n"
-        "6. **Review:** you get the smallest passing diff, its cost, and every branch it tried.")
+        "6. **Review:** you get the smallest passing diff, its cost, and every branch it tried.\n\n"
+        "**Build mode** adds a step 0: Nemotron 3 Ultra turns your feature request into new pytest "
+        "tests, which must be valid and fail on the current code. They are frozen, and steps 1-6 then "
+        "write the code. The review branch holds the tests and the code together.")
 
 recordings = hosting.recorded_runs()
 job = ss.job
@@ -209,7 +245,17 @@ with st.sidebar:
         else:
             repo = st.text_input("Repo path", "workspace/invoice",
                                  help="A folder with failing tests. Create the demos with: python scripts/make_demo.py")
-        task = st.text_area("Task", "Make the failing tests pass without changing the tests.", height=90)
+        job_kind = st.radio("What to do", ["🔧 Fix failing tests", "🏗️ Build a feature"],
+                            horizontal=True, disabled=running)
+        build_mode = job_kind.startswith("🏗️")
+        if build_mode:
+            request = st.text_area("Feature request", BUILD_EXAMPLE, height=160,
+                                   help="Plain English. The agent writes tests for this first, then the code. "
+                                        "Works best on a repo whose tests pass, e.g. the library demo.")
+            task = request
+        else:
+            request = None
+            task = st.text_area("Task", "Make the failing tests pass without changing the tests.", height=90)
         test_cmd = st.text_input("Test command", "pytest -q")
         branches = st.slider("Parallel branches", 1, 4 if HOSTED else 5, 3)
         rounds = st.slider("Max rounds", 1, 3 if HOSTED else 4, 3)
@@ -268,10 +314,10 @@ if mode.startswith("▶️"):
     if ss.replay and ss.replay["run_id"] == rec["run_id"]:
         with st.expander(f"Full log ({len(rec['logs'])} lines)"):
             st.code("\n".join(rec["logs"]), language="text")
-        render_results(rec["summary"], rec["results"], rec["winner"])
-        w = next((r for r in rec["results"] if r["branch_id"] == rec["winner"]), None)
+        render_results(rec["summary"], rec["results"], rec["winner"], rec.get("spec"))
+        w = rec.get("winner_result") or next((r for r in rec["results"] if r["branch_id"] == rec["winner"]), None)
         if w:
-            st.subheader("The fix")
+            st.subheader("The tests and the code" if rec.get("mode") == "build" else "The fix")
             offer_patch(w, rec["repo"])
     st.stop()
 
@@ -345,7 +391,7 @@ if st.button("Run agent", type="primary", disabled=running):
     kwargs = dict(repo=repo_dir, task=task, test_cmd=test_cmd, branches=branches, rounds=rounds,
                   max_turns=max_turns, first_green=first_green,
                   thinking=None if thinking == "on" else thinking, max_usd=max_usd or None,
-                  ladder=ladder, make_branch=not HOSTED)
+                  ladder=ladder, make_branch=not HOSTED, build=request)
     if HOSTED:
         kwargs["work_root"] = str(Path(repo_dir).parent / "branches")
     threading.Thread(target=worker, args=(job, kwargs, release, ledger), daemon=True).start()
@@ -375,8 +421,8 @@ if job and job["done"]:
         st.stop()
     state = job["state"]
     w = state.get("winner")
-    render_results(state["summary"], state["results"], w and w["branch_id"])
-    if state["summary"]["status"] == "already_green":
+    render_results(state["summary"], state["results"], w and w["branch_id"], state.get("spec"))
+    if state["summary"]["status"] in ("already_green", "spec_failed"):
         st.stop()
 
     st.subheader("Your decision" if not HOSTED else "The fix")
@@ -391,13 +437,15 @@ if job and job["done"]:
 
     g = state["summary"].get("git") or {}
     if g.get("branch"):
-        st.info(f"The fix is waiting on branch `{g['branch']}` ({g['commit']}). Your files are untouched.")
+        st.info(f"The {'feature' if state.get('mode') == 'build' else 'fix'} is waiting on branch "
+                f"`{g['branch']}` ({g['commit']}). Your files are untouched.")
     elif g.get("error"):
         st.info(f"No review branch ({g['error']}). Approving will copy the fixed files in directly.")
 
     left, right = st.columns(2)
     with left:
-        st.markdown(f"**Proposed change** from {w['branch_id']}")
+        st.markdown(f"**Proposed change** from {w['branch_id']}"
+                    + (" (new tests + code)" if state.get("mode") == "build" else ""))
         st.caption(w["strategy"])
         st.code(w["patch"], language="diff")
     with right:

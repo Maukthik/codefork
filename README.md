@@ -2,7 +2,7 @@
 
 # 🍴 Fork: Red to Green
 
-**A coding agent that turns failing tests green by trying several fixes in parallel, in forked cloud sandboxes, and keeping the smallest one that passes.**
+**A coding agent that turns failing tests green by trying several fixes in parallel, in forked cloud sandboxes, and keeping the smallest one that passes. In build mode it goes from a plain-English feature request to tests, then to code.**
 
 [![tests](https://github.com/Maukthik/codefork/actions/workflows/tests.yml/badge.svg)](https://github.com/Maukthik/codefork/actions/workflows/tests.yml)
 ![Python](https://img.shields.io/badge/python-3.12+-3776AB?logo=python&logoColor=white)
@@ -32,10 +32,28 @@ Point Fork at a repo with failing tests. It:
 
 A real run on the included invoice demo: 3 parallel branches, all green, 10-line winning diff across 2 files, about 57k tokens, **about one US cent**.
 
+## Build mode: tests first, then code
+
+Fork can also build a new feature. Describe it in plain English:
+
+```bash
+python agent_graph.py --repo workspace/library --build "Add overdue fines: Rs 5 per day late, capped at Rs 100 per loan. \
+  Add Library.fines_owed(member) and Library.pay_fine(member, amount); overpaying raises ValueError."
+```
+
+1. **Spec writer.** Before any code exists, Nemotron 3 Ultra writes new pytest files that define the feature, plus a short note on the interface they expect.
+2. **Checked before use.** The files must be new test files (existing tests are never overwritten), parse, contain tests, and **fail on the current code**. Tests that already pass don't test anything new, so they're rejected and the model retries with the reason.
+3. **Frozen.** The tests go into a spec copy of the repo, and every branch forks from that copy. The tamper guard treats them exactly like the original tests: read-only, restored before judging. The agent can't weaken the spec to pass it.
+4. **Same engine.** Planning, parallel branches, escalation and partial-fix merging then write the code. If the new tests can't even be imported yet, the judge still requires every one of them to pass.
+5. **One review branch.** `fork/build-<run>` holds the new tests and the code together, so you review the spec and the implementation side by side.
+
+`examples/library` is a small green repo for trying this, with a ready-made request in its README. In the UI, choose **Build a feature**.
+
 ## How it works
 
 ```mermaid
 flowchart LR
+    Q[Feature request] -.->|build mode| W[Spec writer<br/>Nemotron 3 Ultra<br/>tests must be RED] -.->|frozen tests| B
     B[Baseline<br/>run tests in sandbox] -->|red| P[Planner<br/>Nemotron 3 Ultra]
     B -->|already green| F
     P -->|N strategies| E1[Executor b0<br/>Nemotron 3 Nano]
@@ -51,17 +69,17 @@ Built as a [LangGraph](https://github.com/langchain-ai/langgraph) `StateGraph`. 
 
 | Piece | File |
 |---|---|
-| Graph, nodes, sandbox, tamper guard, cost tracking | `agent_graph.py` |
-| Streamlit UI: run, watch live, compare branches, approve or reject; hosted demo mode | `graph_app.py` |
+| Graph, nodes, sandbox, tamper guard, cost tracking, build-mode spec writer | `agent_graph.py` |
+| Streamlit UI: fix or build, watch live, compare branches, approve or reject; hosted demo mode | `graph_app.py` |
 | Hosted demo helpers: demo repos, GitHub import, access code, spend caps, replays | `hosting.py` |
-| Offline tests (fake LLM, fake sandbox, headless UI tests): 83 tests | `test_agent_graph.py`, `test_hosting.py` |
-| Demo repos with planted bugs: `invoice` (3 bugs, 2 files), `bookstore` (7 bugs, 5 modules) | `examples/` |
+| Offline tests (fake LLM, fake sandbox, headless UI tests, benchmark harness): 103 tests | `test_agent_graph.py`, `test_hosting.py`, `test_bench.py` |
+| Demo repos: `invoice` (3 bugs, 2 files), `bookstore` (7 bugs, 5 modules), `library` (green, for build mode) | `examples/` |
 
 ## How NVIDIA Nemotron and Nebius are used
 
 | | What | Why |
 |---|---|---|
-| **Nemotron 3 Ultra** (`nvidia/Nemotron-3-Ultra-550b-a55b`) | Planner and reflector | Few calls, needs the best reasoning: root-cause hypotheses and failure analysis |
+| **Nemotron 3 Ultra** (`nvidia/Nemotron-3-Ultra-550b-a55b`) | Spec writer (build mode), planner and reflector | Few calls, needs the best reasoning: root-cause hypotheses and failure analysis |
 | **Nemotron 3 Nano** (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) | Executor, round 1 (the many edit and test turns) | Fast and cheap, so trying 3 strategies in parallel costs less than one big-model attempt |
 | **Nemotron 3 Super** (`nvidia/nemotron-3-super-120b-a12b`) | Executor, round 2 (escalation) | Only paid for when Nano couldn't finish |
 | **Nemotron 3 Ultra** as executor | Round 3 (escalation) | Last resort for the hardest remaining bugs |
@@ -123,7 +141,7 @@ cp .env.example .env                 # Windows: copy .env.example .env
 python scripts/list_models.py        # check your key and the exact Nemotron model ids
 python scripts/hello_sandbox.py      # check the Nebius sandbox works
 
-python scripts/make_demo.py          # creates workspace/invoice (3 bugs) and workspace/bookstore (7 bugs)
+python scripts/make_demo.py          # creates workspace/invoice (3 bugs), workspace/bookstore (7 bugs), workspace/library (green)
 ```
 
 **Web UI**
@@ -139,10 +157,12 @@ python agent_graph.py --repo workspace/invoice --branches 3 --rounds 2 --max-usd
 python agent_graph.py --repo workspace/bookstore --branches 3 --rounds 3 --ladder nano,super,ultra --max-usd 0.50
 git -C workspace/invoice diff main fork/fix-<run_id>     # review
 git -C workspace/invoice merge fork/fix-<run_id>         # accept
+python agent_graph.py --repo workspace/library --build "Add overdue fines ..."   # build mode -> fork/build-<run_id>
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `--build` | off | Build mode: a feature request; tests are written first, then the code |
 | `--branches` | 3 | Parallel strategies per round |
 | `--rounds` | 2 | Plan, execute, reflect cycles |
 | `--ladder` | `EXECUTOR_LADDER` | Executor model per round, e.g. `nano,super,ultra` |
@@ -158,6 +178,7 @@ git -C workspace/invoice merge fork/fix-<run_id>         # accept
 | Path | Contents |
 |---|---|
 | `fork/fix-<run_id>` branch in the target repo | The winning fix, with strategy, diff size and test result in the commit message |
+| `fork/build-<run_id>` branch (build mode) | The new tests and the code that passes them, in one commit |
 | `logs/graph_<run_id>.json` | Summary: status, every branch, tokens and USD by stage, tamper attempts |
 | `logs/graph_<run_id>_winner.patch` | The fix as a `git apply`-able patch |
 | `logs/trajectories/*.json` | Full conversations of green branches (fine-tuning data); red ones in `failed/` |
@@ -176,6 +197,7 @@ All settings live in `.env` (see `.env.example`). The important ones:
 | `SANDBOX` | `nebius` | `local` runs commands on your machine. Only for tests and trusted repos; hidden in the UI unless `ALLOW_LOCAL_SANDBOX=1` |
 | `SANDBOX_IMAGE` | `python:3.12-slim` | Base image for the sandbox checkpoint |
 | `MAX_USD_PER_RUN` | no cap | Default spend cap |
+| `SPEC_ATTEMPTS` | 2 | Build mode: tries for the spec writer to produce valid, red tests |
 | `PRICES_JSON` | Nano $0.06/$0.24, Super $0.30/$0.90, Ultra $1/$3 per 1M tokens | Override the price table |
 
 ## Tests
@@ -184,7 +206,7 @@ All settings live in `.env` (see `.env.example`). The important ones:
 python -m pytest -q
 ```
 
-83 tests. They script the model's replies and fake the Nebius sandbox, so they need **no API key, no network and no credits**, and they run in CI on every push. They cover the graph (branching, reflection, first-green cancellation, budget cap, escalation, partial-fix merging, carrying progress between rounds), the tamper guard, the Nebius checkpoint and overlay logic, git review branches, patch output and line endings, concurrent runs keeping separate logs, sandbox retries, GitHub zip import (size limits, path-traversal checks) and the Streamlit app itself, driven headless with `streamlit.testing`.
+103 tests. They script the model's replies and fake the Nebius sandbox, so they need **no API key, no network and no credits**, and they run in CI on every push. They cover the graph (branching, reflection, first-green cancellation, budget cap, escalation, partial-fix merging, carrying progress between rounds), build mode (spec validation, the red check and retry, counting tests that can't import yet, read-only new tests, the build branch), the tamper guard, the Nebius checkpoint and overlay logic, git review branches, patch output and line endings, concurrent runs keeping separate logs, sandbox retries, GitHub zip import (size limits, path-traversal checks) and the Streamlit app itself, driven headless with `streamlit.testing`.
 
 ## Project layout
 
@@ -198,6 +220,7 @@ python -m pytest -q
 ├── examples/               # demo repos with planted bugs; recorded/ = replayable runs
 ├── .streamlit/             # app config and secrets template
 ├── scripts/                # make_demo, list_models, connectivity checks
+├── bench/                  # SWE-rebench harness: probe, environment validation, runner (Stage 3)
 ├── legacy/                 # first single-agent version (planner, executor, reflector loop)
 └── .github/workflows/      # CI
 ```
@@ -214,7 +237,7 @@ python -m pytest -q
 - [x] Tuned from real runs: snippet edit tool, stuck-branch detection, `/app` path mapping, tool-name aliases, minimal-change planning
 - [x] Hosted demo: replays, live runs on demos or GitHub repos, access code and spend caps
 - [ ] Benchmark on SWE-rebench
-- [ ] Build mode: prompt, then tests, then code
+- [x] Build mode: prompt, then tests (validated and red), then code, on one review branch
 - [ ] Fine-tuned Nemotron executor from collected trajectories
 - [ ] GitHub Action: run Fork on a failing CI build and open a PR
 

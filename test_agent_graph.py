@@ -860,3 +860,135 @@ def test_thinking_emitted_as_a_tool_call_gets_a_nudge(tmp_path):
 
 def test_planner_is_told_to_split_independent_bugs():
     assert "split them" in ag.PLANNER_PROMPT and "merged automatically" in ag.PLANNER_PROMPT
+
+
+# --- build mode: tests first, then code ------------------------------------------
+
+ADD_ONLY = "def add(a, b):\n    return a + b\n"
+WITH_MUL = ADD_ONLY + "\n\ndef multiply(a, b):\n    return a * b\n"
+MUL_TESTS = ("from calc import multiply\n\n\ndef test_multiply():\n    assert multiply(2, 3) == 6\n\n\n"
+             "def test_multiply_by_zero():\n    assert multiply(7, 0) == 0\n")
+WEAK_TESTS = "from calc import add\n\n\ndef test_add_again():\n    assert add(1, 1) == 2\n"
+
+
+def spec_reply(path="test_multiply.py", content=MUL_TESTS):
+    return ("### SUMMARY\nmultiply works, including by zero\n### INTERFACE\ncalc.multiply(a, b)\n"
+            f"### FILE: {path}\n```python\n{content}```\n")
+
+
+@pytest.fixture
+def green_repo(tmp_path, monkeypatch):
+    monkeypatch.setenv("SANDBOX", "local")
+    monkeypatch.setattr(ag, "BASE_DIR", tmp_path)
+    r = tmp_path / "repo"
+    r.mkdir()
+    (r / "calc.py").write_text(ADD_ONLY)
+    (r / "test_calc.py").write_text(TEST)
+    return r
+
+
+def make_build_chat(spec_replies, executor_calls=None):
+    """spec_replies: one reply per spec-writer call (the last repeats). The executor writes
+    calc.py with multiply on its first turn, unless executor_calls gives its turns."""
+    seen = {"spec": 0, "planner": 0}
+    turns = executor_calls or [[call("write_file", path="calc.py", content=WITH_MUL)]]
+
+    def fake_chat(model, messages, tools=None, **kwargs):
+        system = messages[0]["content"]
+        if "spec writer" in system:
+            reply = spec_replies[min(seen["spec"], len(spec_replies) - 1)]
+            seen["spec"] += 1
+            return msg(reply), (200, 80)
+        if "planner" in system:
+            seen["planner"] += 1
+            return msg(json.dumps({"strategies": ["add multiply to calc.py"]})), (100, 20)
+        if "reflector" in system:
+            return msg("try again"), (50, 10)
+        k = sum(1 for m in messages if m["role"] == "assistant")
+        return (msg("", turns[k]) if k < len(turns) else msg("done")), (40, 10)
+
+    return fake_chat, seen
+
+
+def test_parse_spec_reads_sections_and_files():
+    s = ag.parse_spec(spec_reply("/app/tests/test_m.py"))
+    assert s["summary"].startswith("multiply works")
+    assert s["interface"] == "calc.multiply(a, b)"
+    assert s["files"] == {"tests/test_m.py": MUL_TESTS}
+    assert ag.count_tests(MUL_TESTS) == 2
+    assert ag.count_tests("class TestX:\n    def test_a(self): pass\n    def helper(self): pass\n") == 1
+
+
+def test_validate_spec_rejects_bad_test_files(green_repo):
+    bad = {
+        "test_calc.py": MUL_TESTS,                       # overwrites an existing test
+        "multiply_check.py": MUL_TESTS,                  # not a test file name
+        "test_syntax.py": "def test_x(:\n",              # doesn't parse
+        "test_empty.py": "x = 1\n",                      # no tests
+        "../test_out.py": MUL_TESTS,                     # escapes the repo
+    }
+    problems = " | ".join(ag.validate_spec(str(green_repo), bad))
+    for needle in ("test_calc.py already exists", "multiply_check.py: test files must be named",
+                   "test_syntax.py: syntax error", "test_empty.py: no test functions", "escapes"):
+        assert needle in problems
+    assert ag.validate_spec(str(green_repo), {"test_multiply.py": MUL_TESTS}) == []
+
+
+def test_build_mode_writes_tests_then_code_on_one_branch(green_repo, tmp_path, monkeypatch):
+    git_init(green_repo)
+    fake, _ = make_build_chat([spec_reply()])
+    monkeypatch.setattr(ag, "chat", fake)
+    s = ag.run(str(green_repo), "", branches=1, rounds=1, work_root=str(tmp_path / "branches"),
+               build="Add multiply(a, b) to calc")
+    assert s["mode"] == "build" and s["status"] == "green"
+    assert s["spec"]["ok"] and s["spec"]["tests"] == 2 and s["spec"]["files"] == ["test_multiply.py"]
+    assert "spec" in s["tokens_by_stage"]
+    branch = s["git"]["branch"]
+    assert branch.startswith("fork/build-")
+    assert sh(green_repo, "show", f"{branch}:test_multiply.py") + "\n" == MUL_TESTS.rstrip("\n") + "\n"
+    assert "def multiply" in sh(green_repo, "show", f"{branch}:calc.py")
+    assert sorted(s["winner"]["changed"]) == ["calc.py", "test_multiply.py"]
+    assert sh(green_repo, "log", "-1", "--format=%s", branch).startswith("fork: build Add multiply")
+    assert (green_repo / "calc.py").read_text() == ADD_ONLY          # working tree untouched
+    assert not (green_repo / "test_multiply.py").exists()
+
+
+def test_build_mode_rejects_tests_that_already_pass_and_retries(green_repo, tmp_path, monkeypatch):
+    fake, seen = make_build_chat([spec_reply("test_weak.py", WEAK_TESTS), spec_reply()])
+    monkeypatch.setattr(ag, "chat", fake)
+    s = ag.run(str(green_repo), "", branches=1, rounds=1, make_branch=False,
+               work_root=str(tmp_path / "branches"), build="Add multiply")
+    assert seen["spec"] == 2 and s["spec"]["attempts"] == 2
+    assert s["status"] == "green"
+
+
+def test_build_mode_stops_if_it_cannot_write_valid_tests(green_repo, tmp_path, monkeypatch):
+    fake, seen = make_build_chat(["I think you should add a multiply function."])
+    monkeypatch.setattr(ag, "chat", fake)
+    s = ag.run(str(green_repo), "", work_root=str(tmp_path / "branches"), build="Add multiply")
+    assert s["status"] == "spec_failed" and not s["spec"]["ok"]
+    assert seen["spec"] == ag.SPEC_ATTEMPTS and seen["planner"] == 0   # no code attempts paid for
+    assert s["branches"] == []
+
+
+def test_build_mode_counts_new_tests_even_before_they_import(green_repo, tmp_path, monkeypatch):
+    fake, _ = make_build_chat([spec_reply()])
+    monkeypatch.setattr(ag, "chat", fake)
+    final = ag.run(str(green_repo), "", branches=1, rounds=1, make_branch=False, full=True,
+                   work_root=str(tmp_path / "branches"), build="Add multiply")
+    # `from calc import multiply` fails at collection, so pytest reports one error and no counts.
+    # The judge must still require all 3 tests (1 old + 2 new) to pass.
+    assert final["baseline_total"] == 3 and final["expected_tests"] == 3
+
+
+def test_new_tests_are_read_only_for_the_executor(green_repo, tmp_path, monkeypatch):
+    cheat = [[call("write_file", path="test_multiply.py", content="def test_multiply():\n    pass\n")],
+             [call("write_file", path="calc.py", content=WITH_MUL)]]
+    fake, _ = make_build_chat([spec_reply()], executor_calls=cheat)
+    monkeypatch.setattr(ag, "chat", fake)
+    final = ag.run(str(green_repo), "", branches=1, rounds=1, make_branch=False, full=True,
+                   work_root=str(tmp_path / "branches"), build="Add multiply")
+    r = final["results"][0]
+    assert r["refused_writes"] == 1 and r["passed"]
+    assert "assert multiply(2, 3) == 6" in final["winner"]["patch"]     # the real tests shipped
+    assert final["repo_dir"] == str(green_repo.resolve())                # state points back at the repo
