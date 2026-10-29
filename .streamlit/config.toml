@@ -6,3 +6,6 @@ gatherUsageStats = false
 
 [theme]
 primaryColor = "#76B900"
+
+[client]
+showSidebarNavigation = false

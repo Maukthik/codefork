@@ -1,6 +1,6 @@
 langgraph>=1.2
 openai>=1.40
 python-dotenv>=1.0
-streamlit>=1.40
+streamlit>=1.45
 contree-sdk>=0.3.6
 pytest>=8

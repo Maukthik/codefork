@@ -51,9 +51,9 @@ ss.setdefault("replay", None)     # replay mode: loaded record
 
 @st.cache_resource
 def shared() -> dict:
-    """One per app process: only one live run at a time on the hosted demo, and a daily budget."""
-    return {"lock": threading.Lock(),
-            "ledger": hosting.Ledger(float(os.getenv("DAILY_BUDGET_USD", "3.00")))}
+    """One per app process: only one live run at a time on the hosted demo, and a daily budget
+    (shared with the Student Lab page)."""
+    return hosting.shared()
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +230,12 @@ running = bool(job and not job["done"])
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
+    try:   # page links only resolve when graph_app.py is the entry point (always, when deployed)
+        st.page_link("graph_app.py", label="Fork: Red to Green", icon="🍴")
+        st.page_link("pages/1_Student_Lab.py", label="Student Lab", icon="🎓")
+        st.divider()
+    except Exception:
+        pass
     modes = (["▶️ Replay a recorded run"] if recordings else []) + ["⚡ Run live"]
     mode = st.radio("Mode", modes, index=0 if HOSTED else len(modes) - 1, disabled=running)
 

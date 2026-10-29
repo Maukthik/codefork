@@ -49,6 +49,17 @@ python agent_graph.py --repo workspace/library --build "Add overdue fines: Rs 5 
 
 `examples/library` is a small green repo for trying this, with a ready-made request in its README. In the UI, choose **Build a feature**.
 
+## Student Lab: a coding interface for a class
+
+A second page of the app (`pages/1_Student_Lab.py`, at `/Student_Lab` on the hosted app) for students, built on build mode:
+
+- **Describe a program.** Type what it should do (e.g. "Write grade(marks) that turns marks out of 100 into S, A, B ... and raises ValueError outside 0-100"). Fork writes the tests first, then the code, and shows each test passing.
+- **Fix my code.** Paste up to 300 lines and say what it should do. You get the fixed code, a before/after diff, and the tests it now passes. If the code is already right, it says so and writes nothing.
+- **Try it yourself.** Call the finished code with your own input, e.g. `grade(89)`. It runs in the sandbox, not on the web server.
+- **Shown in student terms:** live steps ("Wrote the tests from your description", "Writing code in parallel attempts", ...), a pass/fail list of named tests, the test code, downloads for `solution.py` and the tests, and the full log under *Behind the scenes*.
+
+**For a teacher running it for a class** (Streamlit Cloud secrets): `STUDENT_ACCESS_CODE` is the code to hand out (falls back to `DEMO_ACCESS_CODE`), `STUDENT_MAX_USD_PER_RUN` caps each run (default $0.10), `STUDENT_MAX_CONCURRENT` sets how many students can run at once (default 3; others are asked to wait a minute), and `DAILY_BUDGET_USD` caps the whole app per day. Runs are kept small: 2 parallel attempts, 2 rounds, Nano then Super.
+
 ## How it works
 
 ```mermaid
@@ -72,7 +83,8 @@ Built as a [LangGraph](https://github.com/langchain-ai/langgraph) `StateGraph`. 
 | Graph, nodes, sandbox, tamper guard, cost tracking, build-mode spec writer | `agent_graph.py` |
 | Streamlit UI: fix or build, watch live, compare branches, approve or reject; hosted demo mode | `graph_app.py` |
 | Hosted demo helpers: demo repos, GitHub import, access code, spend caps, replays | `hosting.py` |
-| Offline tests (fake LLM, fake sandbox, headless UI tests, benchmark harness): 103 tests | `test_agent_graph.py`, `test_hosting.py`, `test_bench.py` |
+| Student Lab: describe a program or fix my code, test-by-test results, try-it box | `pages/1_Student_Lab.py`, `student.py` |
+| Offline tests (fake LLM, fake sandbox, headless UI tests, benchmark harness): 114 tests | `test_agent_graph.py`, `test_hosting.py`, `test_bench.py`, `test_student.py` |
 | Demo repos: `invoice` (3 bugs, 2 files), `bookstore` (7 bugs, 5 modules), `library` (green, for build mode) | `examples/` |
 
 ## How NVIDIA Nemotron and Nebius are used
@@ -206,7 +218,7 @@ All settings live in `.env` (see `.env.example`). The important ones:
 python -m pytest -q
 ```
 
-103 tests. They script the model's replies and fake the Nebius sandbox, so they need **no API key, no network and no credits**, and they run in CI on every push. They cover the graph (branching, reflection, first-green cancellation, budget cap, escalation, partial-fix merging, carrying progress between rounds), build mode (spec validation, the red check and retry, counting tests that can't import yet, read-only new tests, the build branch), the tamper guard, the Nebius checkpoint and overlay logic, git review branches, patch output and line endings, concurrent runs keeping separate logs, sandbox retries, GitHub zip import (size limits, path-traversal checks) and the Streamlit app itself, driven headless with `streamlit.testing`.
+114 tests. They script the model's replies and fake the Nebius sandbox, so they need **no API key, no network and no credits**, and they run in CI on every push. They cover the graph (branching, reflection, first-green cancellation, budget cap, escalation, partial-fix merging, carrying progress between rounds), build mode (spec validation, the red check and retry, counting tests that can't import yet, read-only new tests, the build branch), the Student Lab (both modes end to end, "already correct" code, the try-it box, the class access code, the page driven headless), the tamper guard, the Nebius checkpoint and overlay logic, git review branches, patch output and line endings, concurrent runs keeping separate logs, sandbox retries, GitHub zip import (size limits, path-traversal checks) and the Streamlit app itself, driven headless with `streamlit.testing`.
 
 ## Project layout
 
@@ -214,6 +226,8 @@ python -m pytest -q
 .
 ├── agent_graph.py          # the agent (LangGraph)
 ├── graph_app.py            # Streamlit UI (local and hosted)
+├── pages/1_Student_Lab.py  # Student Lab page: describe a program / fix my code
+├── student.py              # Student Lab logic (requests, results, try-it)
 ├── hosting.py              # hosted demo: repo import, access code, budgets, replays
 ├── test_agent_graph.py     # offline agent tests
 ├── test_hosting.py         # hosting + headless UI tests
@@ -236,6 +250,7 @@ python -m pytest -q
 - [x] Harder multi-file demo repo (`examples/bookstore`)
 - [x] Tuned from real runs: snippet edit tool, stuck-branch detection, `/app` path mapping, tool-name aliases, minimal-change planning
 - [x] Hosted demo: replays, live runs on demos or GitHub repos, access code and spend caps
+- [x] Student Lab: describe a program or fix my code, with per-test results and a try-it box
 - [ ] Benchmark on SWE-rebench
 - [x] Build mode: prompt, then tests (validated and red), then code, on one review branch
 - [ ] Fine-tuned Nemotron executor from collected trajectories

@@ -737,6 +737,7 @@ class GraphState(TypedDict, total=False):
     target_repo: str           # the user's repo; repo_dir points at the spec copy during the run
     spec: dict                 # the test files written, their count, summary, interface
     expected_tests: int        # tests the judge must see pass (new tests may not import yet)
+    spec_must_fail: bool       # False: tests that pass at once are fine (checking existing code)
 
 
 # ---------------------------------------------------------------------------
@@ -1180,7 +1181,7 @@ RULES:
   arguments, choose clear ones and list them under INTERFACE.
 - 4 to 10 focused, deterministic tests: the main behaviour, every edge case and error the request
   mentions. No network, no sleeps, no randomness, no private helpers, no file system side effects.
-- The tests must FAIL on the current code (the feature doesn't exist yet) and pass once it's built.
+{red_rule}
 - Don't contradict existing behaviour or the existing tests.
 
 Reply in exactly this format:
@@ -1193,6 +1194,10 @@ Reply in exactly this format:
 <complete file content>
 ```
 (one ### FILE block per test file)"""
+
+RED_RULE = "- The tests must FAIL on the current code (the feature doesn't exist yet) and pass once it's built."
+CHECK_RULE = ("- Test the behaviour the user describes, as correct code would behave. The current code may be "
+              "right or may have bugs: never shape the tests around what it does now.")
 
 _FILE_RE = re.compile(r"^###\s*FILE:\s*`?([^\s`]+)`?\s*\n```[\w+-]*\n(.*?)\n```", re.M | re.S)
 
@@ -1267,8 +1272,11 @@ def spec_writer_node(state: GraphState) -> dict:
     spec_dir = str(Path(state["work_root"]) / run_id / "spec")
     model = stage_model("planner")
     spend = budget(run_id)
+    # Fix mode for student code: the code exists and may already be right, so tests that pass
+    # straight away are a valid answer ("your code is correct"), not a reason to retry.
+    must_fail = state.get("spec_must_fail", True)
     messages = [
-        {"role": "system", "content": SPEC_PROMPT},
+        {"role": "system", "content": SPEC_PROMPT.replace("{red_rule}", RED_RULE if must_fail else CHECK_RULE)},
         {"role": "user", "content": (f"Feature request:\n{request}\n\nTest command: {test_cmd}\n\n"
                                      f"Repo files:\n{repo_context(target)}")},
     ]
@@ -1289,7 +1297,7 @@ def spec_writer_node(state: GraphState) -> dict:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 write_preserving_newlines(p, content)
             code, out = run_in_sandbox(spec_dir, test_cmd)
-            if code == 0:
+            if code == 0 and must_fail:
                 problems = ["The tests already pass on the current code, so they don't test the new "
                             "feature. Test behaviour that doesn't exist yet."]
             elif code == 5:
@@ -1318,7 +1326,7 @@ def spec_writer_node(state: GraphState) -> dict:
     expected = collected or sum(count_tests(c) for rel, c in collect_files(spec_dir).items()
                                 if rel.endswith(".py") and is_protected(rel))
     log(f"[spec] wrote {', '.join(files)} ({new_tests} new tests, {expected} in the suite), "
-        f"RED as expected. Tests are now read-only.")
+        + ("RED as expected" if code else "already GREEN on the current code") + ". Tests are now read-only.")
     if record["interface"]:
         log(f"[spec] interface: {record['interface'][:160]}")
     task = (f"Build this feature so the new tests pass: {request}\n"
@@ -1569,9 +1577,11 @@ def run(repo: str, task: str, test_cmd: str = "pytest -q", branches: int = 3, ro
         make_branch: bool = True, on_log=None, full: bool = False,
         first_green: bool = True, thinking: Optional[str] = None,
         max_usd: Optional[float] = None, ladder: Optional[str] = None,
-        build: Optional[str] = None) -> dict:
+        build: Optional[str] = None, spec_must_fail: bool = True) -> dict:
     """Returns the summary dict, or the full final graph state when full=True.
     build: a feature request. Build mode writes tests for it first, then the code.
+    spec_must_fail: build mode rejects tests that already pass (the default). False = the code
+        exists and may be right, so passing tests just mean there is nothing to fix.
     max_usd: stop starting new LLM calls once this run has spent this much.
     ladder: executor model per round, e.g. "nano,super,ultra" (default: EXECUTOR_LADDER)."""
     repo_dir = str(Path(repo).resolve())
@@ -1590,7 +1600,7 @@ def run(repo: str, task: str, test_cmd: str = "pytest -q", branches: int = 3, ro
         "max_usd": max_usd,
         "ladder": parse_ladder(ladder if ladder is not None else os.getenv("EXECUTOR_LADDER")),
         "results": [], "usage": [], "feedback": "",
-        "mode": "build" if build else "fix", "request": build or "",
+        "mode": "build" if build else "fix", "request": build or "", "spec_must_fail": spec_must_fail,
     }
     if build:
         state["task"] = build

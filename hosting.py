@@ -127,6 +127,17 @@ def access_ok(entered: str) -> bool:
     return not expected or hmac.compare_digest((entered or "").strip(), expected)
 
 
+def student_access_ok(entered: str) -> bool:
+    """The Student Lab can have its own code (STUDENT_ACCESS_CODE) for a teacher to hand to a
+    class, so the demo's access code isn't shared around. Without one, the demo code applies."""
+    expected = os.getenv("STUDENT_ACCESS_CODE") or os.getenv("DEMO_ACCESS_CODE", "")
+    return not expected or hmac.compare_digest((entered or "").strip(), expected)
+
+
+def student_run_cap() -> float:
+    return float(os.getenv("STUDENT_MAX_USD_PER_RUN", "0.10"))
+
+
 def per_run_cap() -> float:
     return float(os.getenv("HOSTED_MAX_USD_PER_RUN", "0.25"))
 
@@ -152,6 +163,22 @@ class Ledger:
         with self._lock:
             self._roll()
             self.spent += max(0.0, usd or 0.0)
+
+
+_shared: Optional[dict] = None
+_shared_lock = threading.Lock()
+
+
+def shared() -> dict:
+    """One per app process, shared by every page of the app: the daily budget, the single
+    slot for the full demo's live runs, and a few slots for the Student Lab's small runs."""
+    global _shared
+    with _shared_lock:
+        if _shared is None:
+            _shared = {"lock": threading.Lock(),
+                       "ledger": Ledger(float(os.getenv("DAILY_BUDGET_USD", "3.00"))),
+                       "slots": threading.BoundedSemaphore(int(os.getenv("STUDENT_MAX_CONCURRENT", "3")))}
+        return _shared
 
 
 # ---------------------------------------------------------------------------
