@@ -164,7 +164,7 @@ if job and not job["done"]:
 # results
 # ---------------------------------------------------------------------------
 
-if job and job["done"]:
+if job and job["done"] and job["mode"] == mode:   # results of the other mode stay hidden
     if job["error"]:
         st.error(f"The run stopped with an error: {job['error']}")
         st.stop()

@@ -199,3 +199,15 @@ def test_hosted_page_needs_the_class_code(local, monkeypatch):
     next(b for b in at.button if b.label == "▶ Build it").click().run()
     assert any("class access code" in e.value for e in at.error)
     assert at.session_state["lab_job"] is None
+
+
+@pytest.mark.skipif(streamlit_testing is None, reason="streamlit not installed")
+def test_results_of_one_mode_are_hidden_in_the_other(local, monkeypatch):
+    monkeypatch.setenv("ALLOW_LOCAL_SANDBOX", "1")
+    monkeypatch.setattr(ag, "chat", fake_chat(PAL_TESTS, PAL_CODE))
+    at = streamlit_testing.AppTest.from_file("pages/1_Student_Lab.py", default_timeout=90).run()
+    next(b for b in at.button if b.label == "Palindrome check").click().run()
+    next(b for b in at.button if b.label == "▶ Build it").click().run()
+    assert any("Solved" in s.value for s in at.success)
+    at.radio[0].set_value("🩹 Fix my code").run()
+    assert not any("Solved" in s.value for s in at.success)

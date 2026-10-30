@@ -139,7 +139,7 @@ def show_files(root: str, files: list[str]) -> None:
     for rel in files:
         p = Path(root) / rel
         if p.exists():
-            st.markdown(f"**{rel}**")
+            st.markdown(f"**`{rel}`**")
             st.code(p.read_text(encoding="utf-8", errors="replace"), language="python")
 
 
